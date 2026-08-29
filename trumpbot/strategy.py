@@ -276,7 +276,10 @@ class Engine:
             "event_ticker": ticker,
         }
         new_cancel, source, occ, close = self.cancel_anchor(markets, event_blob, cfg["buffer_min"])
-        if new_cancel and new_cancel != ev.get("cancel_at"):
+        manual = str(ev.get("cancel_source") or "").startswith("telegram")
+        if manual:
+            pass
+        elif new_cancel and new_cancel != ev.get("cancel_at"):
             store.mark_event(ticker, cancel_at=new_cancel, cancel_source=source,
                              occurrence_at=occ, close_at=close)
             if ev.get("cancel_at"):
