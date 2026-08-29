@@ -10,9 +10,10 @@ jobs:
       - name: Ping the app
         run: |
           for i in 1 2 3; do
-            code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 45 "${{ secrets.APP_URL }}?ping=true" || true)
+            code=$(curl -sL -o /dev/null -w "%{http_code}" --max-time 45 "${{ secrets.APP_URL }}/?ping=true" || true)
             echo "attempt $i -> $code"
             if [ "$code" = "200" ]; then exit 0; fi
             sleep 20
           done
           echo "app did not answer 200"
+          exit 1
