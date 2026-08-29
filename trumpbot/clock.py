@@ -6,8 +6,9 @@ specifier. Use pct() everywhere instead.
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from typing import Optional
+import re
+from datetime import date, datetime, time, timezone
+from typing import Optional, Tuple
 
 from zoneinfo import ZoneInfo
 
@@ -89,6 +90,83 @@ def pct(rate: Optional[float], digits: int = 0) -> str:
     if rate is None:
         return "--"
     return f"{100 * float(rate):.{digits}f}%"
+
+
+_MONTHS = {
+    "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
+    "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12,
+}
+
+_ZONES = {
+    "central": CT,
+    "ct": CT,
+    "cst": CT,
+    "cdt": CT,
+    "chicago": CT,
+    "eastern": ZoneInfo("America/New_York"),
+    "et": ZoneInfo("America/New_York"),
+    "est": ZoneInfo("America/New_York"),
+    "edt": ZoneInfo("America/New_York"),
+    "utc": UTC,
+    "gmt": UTC,
+    "z": UTC,
+}
+
+_TICKER_DATE = re.compile(r"-(\d{2})([A-Za-z]{3})(\d{2})$")
+_TIME = re.compile(
+    r"(?P<h>\d{1,2})(?::(?P<m>\d{2}))?\s*(?P<ampm>a\.?m\.?|p\.?m\.?)?",
+    re.I,
+)
+
+
+def date_from_ticker(ticker: str) -> Optional[date]:
+    """KXTRUMPMENTION-26AUG30 -> 2026-08-30."""
+    if not ticker:
+        return None
+    m = _TICKER_DATE.search(str(ticker).strip())
+    if not m:
+        return None
+    yy, mon, dd = m.group(1), m.group(2).upper(), m.group(3)
+    month = _MONTHS.get(mon)
+    if not month:
+        return None
+    try:
+        return date(2000 + int(yy), month, int(dd))
+    except ValueError:
+        return None
+
+
+def parse_when_clock(text: str, on_date: date) -> Tuple[Optional[datetime], Optional[str]]:
+    """Parse '8:00 PM central' onto on_date. Default zone is Central."""
+    if not text or on_date is None:
+        return None, "no time"
+    raw = text.strip()
+    zone = CT
+    leftover = raw
+    for name, tz in sorted(_ZONES.items(), key=lambda x: -len(x[0])):
+        pat = re.compile(rf"(?:^|\s){re.escape(name)}(?:\s|$)", re.I)
+        if pat.search(leftover):
+            zone = tz
+            leftover = pat.sub(" ", leftover)
+            break
+    leftover = leftover.strip(" ,")
+    m = _TIME.search(leftover)
+    if not m:
+        return None, f"could not read a time in '{raw}'"
+    h = int(m.group("h"))
+    minute = int(m.group("m") or 0)
+    ampm = (m.group("ampm") or "").lower().replace(".", "")
+    if ampm.startswith("p") and h < 12:
+        h += 12
+    elif ampm.startswith("a") and h == 12:
+        h = 0
+    if h > 23 or minute > 59:
+        return None, "hour or minute out of range"
+    try:
+        local = datetime.combine(on_date, time(h, minute), tzinfo=zone)
+    except ValueError as exc:
+        return None, str(exc)
+    return to_utc(local), None
 
 
 def human_delta(seconds: Optional[float]) -> str:
