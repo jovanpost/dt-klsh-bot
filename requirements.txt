@@ -1,0 +1,6 @@
+streamlit>=1.36
+requests>=2.31
+cryptography>=42.0
+SQLAlchemy>=2.0
+psycopg2-binary>=2.9
+pandas>=2.0
