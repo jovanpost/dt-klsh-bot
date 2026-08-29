@@ -172,12 +172,19 @@ def _handle_when(arg: str) -> None:
     store.log_line("info", f"{ticker}: /when show {clock.fmt_ct(show)}, "
                            f"cancel {clock.fmt_ct(cancel_at)}")
     secs = (clock.to_utc(cancel_at) - clock.now_utc()).total_seconds()
+    page = ""
+    try:
+        from . import kalshi
+        page = kalshi.event_page_url(series, ev.get("title"), ticker)
+    except Exception:
+        page = ""
     send(
         f"WHEN set ({series})\n{ticker}\n"
-        f"Show: {clock.fmt_ct(show)}\n"
-        f"Cancel at: {clock.fmt_ct(cancel_at)} (show minus {buffer_min}m)\n"
-        f"In: {clock.human_delta(secs)}\n"
-        f"Kalshi's API time will not overwrite this."
+        + (f"{page}\n" if page else "")
+        + f"Event time: {clock.fmt_ct(show)}\n"
+        + f"Cancel at: {clock.fmt_ct(cancel_at)} (event minus {buffer_min}m)\n"
+        + f"In: {clock.human_delta(secs)}\n"
+        + "Resting orders were not moved."
     )
     if cancel_at <= clock.now_utc():
         send(f"{ticker}: that cancel time is already in the past. "
