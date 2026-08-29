@@ -78,6 +78,16 @@ def last_price(market: Dict[str, Any]) -> Optional[float]:
     return to_dollars(market.get("last_price_dollars") or market.get("last_price"))
 
 
+def event_page_url(series: str, title: Optional[str], ticker: str) -> str:
+    """Public Kalshi event page. Deep-links into the app on a phone."""
+    import re
+    series_slug = re.sub(r"[^a-z0-9]+", "", (series or "").lower())
+    raw = (title or ticker or "").lower()
+    title_slug = re.sub(r"[^a-z0-9]+", "-", raw).strip("-")
+    title_slug = re.sub(r"-{2,}", "-", title_slug)
+    return f"https://kalshi.com/markets/{series_slug}/{title_slug}/{ticker}"
+
+
 # ------------------------------------------------------------------ client ---
 
 class KalshiClient:
@@ -181,9 +191,41 @@ class KalshiClient:
     # -- reads ---------------------------------------------------------------
 
     def get_events(self, series_ticker: str, status: str = "open") -> List[Dict[str, Any]]:
-        return self._paged("/events",
-                           {"series_ticker": series_ticker, "status": status},
-                           "events")
+        events, _ = self.get_events_with_milestones(series_ticker, status=status)
+        return events
+
+    def get_events_with_milestones(self, series_ticker: str, status: str = "open"
+                                   ) -> tuple:
+        """Events plus the milestones blob (show start lives here, not on the event)."""
+        events: List[Dict[str, Any]] = []
+        milestones: List[Dict[str, Any]] = []
+        cursor = None
+        for _ in range(25):
+            params: Dict[str, Any] = {
+                "series_ticker": series_ticker,
+                "status": status,
+                "with_milestones": "true",
+                "limit": 200,
+            }
+            if cursor:
+                params["cursor"] = cursor
+            data = self.request("GET", "/events", params=params)
+            events.extend(data.get("events") or [])
+            milestones.extend(data.get("milestones") or [])
+            cursor = data.get("cursor")
+            if not cursor or not (data.get("events") or []):
+                break
+        return events, milestones
+
+    def milestone_for(self, event_ticker: str,
+                      milestones: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        want = (event_ticker or "").upper()
+        for m in milestones:
+            names = list(m.get("primary_event_tickers") or [])
+            names.extend(m.get("related_event_tickers") or [])
+            if any(str(t).upper() == want for t in names):
+                return m
+        return None
 
     def get_event(self, event_ticker: str, nested: bool = True) -> Dict[str, Any]:
         data = self.request("GET", f"/events/{event_ticker}",
