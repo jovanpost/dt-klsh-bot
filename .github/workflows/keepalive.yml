@@ -1,19 +1,44 @@
-name: keepalive
+name: Streamlit keep-alive
+
 on:
   schedule:
     - cron: "*/10 * * * *"
   workflow_dispatch:
+
 jobs:
   ping:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - name: Ping the app
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install Playwright
         run: |
-          for i in 1 2 3; do
-            code=$(curl -sL -o /dev/null -w "%{http_code}" --max-time 45 "${{ secrets.APP_URL }}/?ping=true" || true)
-            echo "attempt $i -> $code"
-            if [ "$code" = "200" ]; then exit 0; fi
-            sleep 20
-          done
-          echo "app did not answer 200"
-          exit 1
+          npm install playwright
+          npx playwright install --with-deps chromium
+      - name: Open the app
+        env:
+          APP_URL: ${{ vars.APP_URL }}
+        run: |
+          node -e '
+          const { chromium } = require("playwright");
+          (async () => {
+            const url = (process.env.APP_URL || "https://dt-klsh-bot.streamlit.app/")
+              .replace(/\/$/, "") + "/?ping=true";
+            const browser = await chromium.launch();
+            const page = await browser.newPage();
+            console.log("pinging " + url);
+            await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
+            await page.waitForTimeout(6000);
+            const wake = page.getByRole("button", { name: /get this app back up/i });
+            if (await wake.count()) {
+              console.log("app was asleep, waking it");
+              await wake.first().click();
+              await page.waitForTimeout(20000);
+            }
+            console.log("done");
+            await browser.close();
+          })();
+          '
