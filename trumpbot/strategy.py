@@ -51,6 +51,7 @@ class Engine:
         self.notify = notify or (lambda msg: None)
         self._last_discovery = 0.0
         self._last_tick_log: Dict[str, float] = {}
+        self._milestones: Dict[str, List[Dict[str, Any]]] = {}
 
     # ------------------------------------------------------------- helpers ---
 
@@ -78,8 +79,14 @@ class Engine:
         occurrence, which is why we take the minimum of the two.
         """
         blobs = list(markets) + [event]
+        mile = clock.parse_iso(event.get("milestone_start") or event.get("start_date"))
         occ, occ_field = self._pick_time(blobs, OCCURRENCE_FIELDS)
         close, close_field = self._pick_time(blobs, CLOSE_FIELDS)
+
+        if mile:
+            occ, occ_field = mile, "milestone"
+            cancel_at = mile - timedelta(minutes=int(buffer_min))
+            return cancel_at, "milestone", occ, close
 
         candidates = [(t, f) for t, f in ((occ, occ_field), (close, close_field)) if t]
         if not candidates:
@@ -94,7 +101,8 @@ class Engine:
         found = 0
         for series, cfg in config.enabled_series().items():
             try:
-                evs = self.client.get_events(series, status="open")
+                evs, miles = self.client.get_events_with_milestones(series, status="open")
+                self._milestones[series] = miles
             except Exception as exc:
                 log.warning("Event discovery failed for %s: %s", series, exc)
                 store.log_line("warn", f"Discovery failed for {series}: {exc}")
@@ -103,14 +111,50 @@ class Engine:
                 ticker = ev.get("event_ticker")
                 if not ticker:
                     continue
+                mile = self.client.milestone_for(ticker, miles)
+                if mile:
+                    ev["milestone_start"] = mile.get("start_date")
+                    ev["milestone_end"] = mile.get("end_date")
+                    ev["milestone_title"] = mile.get("title")
                 known = store.get_event(ticker)
                 if known:
+                    self._maybe_apply_milestone(known, ev, cfg)
                     store.mark_event(ticker, last_seen_at=clock.now_utc(),
                                      status=ev.get("status") or known.get("status"))
                     continue
                 self._register_event(series, ev, cfg)
                 found += 1
         return found
+
+    def _maybe_apply_milestone(self, known: Dict[str, Any], ev: Dict[str, Any],
+                               cfg: Dict[str, Any]) -> None:
+        """If a milestone start appears after first list, tighten cancel_at.
+
+        Never overwrites /when. Never cancels or replaces resting orders.
+        """
+        if str(known.get("cancel_source") or "").startswith("telegram"):
+            return
+        mile = clock.parse_iso(ev.get("milestone_start"))
+        if not mile:
+            return
+        new_cancel = mile - timedelta(minutes=int(cfg["buffer_min"]))
+        old = known.get("cancel_at")
+        if old and clock.to_utc(old) == clock.to_utc(new_cancel):
+            return
+        ticker = known["event_ticker"]
+        store.mark_event(ticker, cancel_at=new_cancel, cancel_source="milestone",
+                         occurrence_at=mile)
+        store.log_line("info", f"{ticker}: milestone start {clock.fmt_ct(mile)}, "
+                               f"cancel {clock.fmt_ct(new_cancel)}")
+        page = kalshi.event_page_url(known.get("series") or ev.get("series_ticker") or "",
+                                     known.get("title") or ev.get("title"), ticker)
+        self.notify(
+            f"TIME UPDATED ({known.get('series')})\n{ticker}\n"
+            f"{page}\n"
+            f"Event time: {clock.fmt_ct(mile)} (milestone)\n"
+            f"Cancel at: {clock.fmt_ct(new_cancel)}\n"
+            f"Resting orders were not moved."
+        )
 
     def _register_event(self, series: str, ev: Dict[str, Any], cfg: Dict[str, Any]) -> None:
         ticker = ev["event_ticker"]
@@ -122,6 +166,7 @@ class Engine:
 
         cancel_at, source, occ, close = self.cancel_anchor(markets, ev, cfg["buffer_min"])
         now = clock.now_utc()
+        page = kalshi.event_page_url(series, ev.get("title"), ticker)
 
         store.upsert_event({
             "event_ticker": ticker,
@@ -149,10 +194,10 @@ class Engine:
         self.notify(
             f"NEW EVENT ({series})\n{ev.get('title') or ticker}\n"
             f"{ticker}\n"
+            f"{page}\n"
+            f"Event time: {clock.fmt_ct(occ)} ({source})\n"
+            f"Cancel at: {clock.fmt_ct(cancel_at)} (event minus {cfg['buffer_min']}m)\n"
             f"Markets now: {len(markets)}\n"
-            f"Occurrence: {clock.fmt_ct(occ)}\n"
-            f"Close: {clock.fmt_ct(close)}\n"
-            f"Cancel at: {clock.fmt_ct(cancel_at)} (from {source})\n"
             f"Resting window: {clock.human_delta(window)}"
         )
 
@@ -274,6 +319,7 @@ class Engine:
             "occurrence_datetime": ev.get("occurrence_at"),
             "close_time": ev.get("close_at"),
             "event_ticker": ticker,
+            "milestone_start": ev.get("occurrence_at") if str(ev.get("cancel_source") or "") == "milestone" else None,
         }
         new_cancel, source, occ, close = self.cancel_anchor(markets, event_blob, cfg["buffer_min"])
         manual = str(ev.get("cancel_source") or "").startswith("telegram")
