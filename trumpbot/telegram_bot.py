@@ -8,8 +8,10 @@ Chat id is your own user id: message the bot once, then call getUpdates.
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
+from datetime import timedelta
 from typing import Optional
 
 import requests
@@ -124,6 +126,64 @@ def events_text() -> str:
     return "\n".join(out)
 
 
+def _handle_when(arg: str) -> None:
+    if not arg:
+        send("Usage: /when KXTRUMPMENTION-26AUG30 8:00 PM central")
+        return
+    tokens = arg.replace(",", " ").split()
+    ticker = None
+    other = []
+    for tok in tokens:
+        up = tok.strip().upper()
+        if up.startswith("KX") or "TRUMPMENTION" in up:
+            ticker = re.sub(r"[.,;]+$", "", up)
+        else:
+            other.append(tok)
+    if not ticker:
+        send("Need an event ticker, e.g. /when KXTRUMPMENTION-26AUG30 8:00 PM central")
+        return
+    ev = store.get_event(ticker)
+    if not ev:
+        hits = [e for e in store.all_events(limit=200)
+                if e["event_ticker"].upper() == ticker
+                or e["event_ticker"].upper().endswith("-" + ticker)]
+        if len(hits) == 1:
+            ev = hits[0]
+            ticker = ev["event_ticker"]
+        else:
+            send(f"No event called {ticker}.")
+            return
+    day = clock.date_from_ticker(ticker)
+    if day is None:
+        send(f"Could not read a date out of {ticker}.")
+        return
+    show, err = clock.parse_when_clock(" ".join(other), day)
+    if err or show is None:
+        send(f"Could not parse time. {err or ''}".strip())
+        return
+    series = ev.get("series") or ""
+    cfg = config.series_config().get(series) or {}
+    buffer_min = int(cfg.get("buffer_min") or 5)
+    cancel_at = show - timedelta(minutes=buffer_min)
+    store.mark_event(ticker,
+                     cancel_at=cancel_at,
+                     cancel_source="telegram /when",
+                     occurrence_at=show)
+    store.log_line("info", f"{ticker}: /when show {clock.fmt_ct(show)}, "
+                           f"cancel {clock.fmt_ct(cancel_at)}")
+    secs = (clock.to_utc(cancel_at) - clock.now_utc()).total_seconds()
+    send(
+        f"WHEN set ({series})\n{ticker}\n"
+        f"Show: {clock.fmt_ct(show)}\n"
+        f"Cancel at: {clock.fmt_ct(cancel_at)} (show minus {buffer_min}m)\n"
+        f"In: {clock.human_delta(secs)}\n"
+        f"Kalshi's API time will not overwrite this."
+    )
+    if cancel_at <= clock.now_utc():
+        send(f"{ticker}: that cancel time is already in the past. "
+             f"Use /cancel {ticker} if you want orders pulled now.")
+
+
 HELP = """Commands:
 /status  - mode, open events per series, resting orders, next cancel, fills today
 /today   - day-clustered fills and P/L, last 7 days
@@ -131,6 +191,7 @@ HELP = """Commands:
 /pause   - stop placing and cancelling (polling continues)
 /resume  - start again
 /cancel EVENT_TICKER - pull all orders for one event now
+/when EVENT_TICKER 8:00 PM central - set show time; cancel is that minus buffer
 /help"""
 
 
@@ -191,6 +252,8 @@ class Listener(threading.Thread):
             elif cmd == "/resume":
                 store.set_state("paused", "0")
                 send("Resumed.")
+            elif cmd == "/when":
+                _handle_when(arg)
             elif cmd == "/cancel":
                 if not arg:
                     send("Give an event ticker: /cancel KXTRUMPMENTIONB-26AUG29")
