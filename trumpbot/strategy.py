@@ -244,7 +244,7 @@ class Engine:
             store.log_line("info", f"[{series}] {ticker}: LOG mode, no orders placed")
             return
 
-                if cancel_at is None:
+        if cancel_at is None:
             store.log_line("warn", f"{ticker}: no time field of any kind; placing anyway")
             self.notify(
                 f"{ticker}: no usable time field. Orders still go out.\n"
@@ -410,7 +410,7 @@ class Engine:
 
         cancel_at = ev.get("cancel_at")
 
-                if cancel_at is None:
+        if cancel_at is None:
             disc = clock.to_utc(ev.get("discovered_at")) if ev.get("discovered_at") else now
             if (now - disc).total_seconds() > ORPHAN_HOURS * 3600:
                 self.cancel_event(ev, reason=f"no time set within {ORPHAN_HOURS}h")
