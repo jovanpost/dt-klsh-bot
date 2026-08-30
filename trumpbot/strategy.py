@@ -244,16 +244,15 @@ class Engine:
             store.log_line("info", f"[{series}] {ticker}: LOG mode, no orders placed")
             return
 
-        if cancel_at is None:
-            # No clock at all. Do NOT rest without a timer -- resting through
-            # an appearance is the exact thing the buffer exists to prevent.
-            # The event stays live so a /when arms it and placement follows.
-            store.log_line("warn", f"{ticker}: no time field of any kind, waiting for /when")
-            self.notify(f"{ticker}: no usable time field at all. Nothing placed yet.\n"
-                        f"Send /when {ticker} <time> and orders go out immediately.")
-            return
+                if cancel_at is None:
+            store.log_line("warn", f"{ticker}: no time field of any kind; placing anyway")
+            self.notify(
+                f"{ticker}: no usable time field. Orders still go out.\n"
+                f"Send /when {ticker} 8:00 PM central to set cancel.\n"
+                f"{page}"
+            )
 
-        if cancel_at <= now:
+        if cancel_at is not None and cancel_at <= now:
             store.mark_event(ticker, cancelled_at=now, notified_cancel=True)
             store.log_line("warn", f"{ticker}: cancel time already passed at discovery")
             self.notify(f"{ticker}: appeared inside the cancel buffer. Logged, not traded.")
@@ -411,15 +410,12 @@ class Engine:
 
         cancel_at = ev.get("cancel_at")
 
-        if cancel_at is None:
-            # Waiting on a /when. Keep watching so a late clock still works,
-            # but do not poll a forgotten event forever.
+                if cancel_at is None:
             disc = clock.to_utc(ev.get("discovered_at")) if ev.get("discovered_at") else now
             if (now - disc).total_seconds() > ORPHAN_HOURS * 3600:
                 self.cancel_event(ev, reason=f"no time set within {ORPHAN_HOURS}h")
-            return
-
-        if clock.to_utc(cancel_at) <= now:
+                return
+        elif clock.to_utc(cancel_at) <= now:
             self.cancel_event(ev, reason="cancel time reached")
             return
 
