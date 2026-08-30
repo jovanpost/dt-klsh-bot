@@ -5,7 +5,7 @@ kwargs that the SQLAlchemy Table did not define, so every insert raised
 "Unconsumed column names" and the bot missed the open by 12 minutes.
 
 Three things must always agree:
-  1. schema.sql          (what Postgres actually has)
+  1. schema.sql / alter.sql  (what Postgres actually has)
   2. the Table() objects below
   3. ORDER_FIELDS / EVENT_FIELDS, which is what record_* is allowed to write
 
@@ -36,13 +36,16 @@ events = Table(
     f"{P}events", metadata,
     Column("event_ticker", Text, primary_key=True),
     Column("series", Text, nullable=False),
+    Column("mode", Text),                 # locked at discovery, never rewritten
     Column("title", Text),
     Column("subtitle", Text),
     Column("discovered_at", DateTime(timezone=True)),
+    Column("discovered_at_open", Boolean, default=False),
     Column("occurrence_at", DateTime(timezone=True)),
     Column("close_at", DateTime(timezone=True)),
     Column("cancel_at", DateTime(timezone=True)),
     Column("cancel_source", Text),
+    Column("nagged_at", DateTime(timezone=True)),
     Column("traded", Boolean, default=False),
     Column("markets_seen", Integer, default=0),
     Column("orders_placed", Integer, default=0),
@@ -57,6 +60,7 @@ orders = Table(
     f"{P}orders", metadata,
     Column("id", Integer, primary_key=True, autoincrement=True),
     Column("series", Text, nullable=False),
+    Column("mode", Text),                 # the mode this row was created under
     Column("event_ticker", Text, nullable=False),
     Column("market_ticker", Text, nullable=False),
     Column("market_title", Text),
@@ -64,7 +68,7 @@ orders = Table(
     Column("limit_price", Numeric),
     Column("count", Numeric),
     Column("dollars", Numeric),
-    Column("dry_run", Boolean, default=True),
+    Column("dry_run", Boolean, default=True),   # kept for history; mode wins
     Column("took_at_open", Boolean, default=False),
     Column("quote_at_place", Numeric),
     Column("placed_at", DateTime(timezone=True)),
@@ -184,7 +188,7 @@ def assert_schema() -> None:
         if missing_in_db:
             problems.append(
                 f"{table.name}: Postgres is missing {sorted(missing_in_db)} "
-                f"-- run ALTER TABLE before starting")
+                f"-- run alter.sql before starting")
         missing_in_model = set(fields) - model_cols
         if missing_in_model:
             problems.append(f"{table.name}: write list has {sorted(missing_in_model)} "
@@ -260,20 +264,28 @@ def record_order(row: Dict[str, Any]) -> None:
         conn.execute(orders.insert().values(**row))
 
 
-def existing_market_tickers(event_ticker: str, dry_run: bool) -> set:
+def existing_market_tickers(event_ticker: str, mode: str) -> set:
+    """Markets in this event we already have a row for, under this mode.
+
+    Keyed on mode, not dry_run: a DRY row and a LIVE row for the same market
+    are different rows and must not shadow each other.
+    """
     with get_engine().connect() as conn:
         rows = conn.execute(
             select(orders.c.market_ticker).where(
                 and_(orders.c.event_ticker == event_ticker,
-                     orders.c.dry_run == dry_run))
+                     orders.c.mode == mode))
         ).all()
     return {r[0] for r in rows}
 
 
-def resting_orders(event_ticker: Optional[str] = None) -> List[Dict[str, Any]]:
+def resting_orders(event_ticker: Optional[str] = None,
+                   mode: Optional[str] = None) -> List[Dict[str, Any]]:
     q = select(orders).where(orders.c.status == "resting")
     if event_ticker:
         q = q.where(orders.c.event_ticker == event_ticker)
+    if mode:
+        q = q.where(orders.c.mode == mode)
     with get_engine().connect() as conn:
         return [dict(r) for r in conn.execute(q).mappings().all()]
 
@@ -297,10 +309,10 @@ def cancel_resting_for_event(event_ticker: str, when: datetime) -> int:
 
 
 def unsettled_orders() -> List[Dict[str, Any]]:
-    """Everything without a result yet -- includes dry-run AND unfilled rows.
+    """Everything without a result yet -- includes DRY AND unfilled rows.
 
-    settle.py on the WNT bot skipped dry_run rows and the dashboard sat at
-    $0.00 forever. Do not add a dry_run filter here.
+    settle.py on the WNT bot skipped dry-run rows and the dashboard sat at
+    $0.00 forever. Do not add a mode filter here.
     """
     with get_engine().connect() as conn:
         rows = conn.execute(
@@ -339,6 +351,23 @@ def get_state(key: str, default: Optional[str] = None) -> Optional[str]:
     with get_engine().connect() as conn:
         r = conn.execute(select(state.c.value).where(state.c.key == key)).first()
     return r[0] if r else default
+
+
+def delete_state(key: str) -> None:
+    with get_engine().begin() as conn:
+        conn.execute(state.delete().where(state.c.key == key))
+
+
+# -------------------------------------------------------------- series mode ---
+
+def get_series_mode(series: str) -> Optional[str]:
+    """DB override set by Telegram /mode. None means fall back to config."""
+    return get_state(f"mode:{series}")
+
+
+def set_series_mode(series: str, mode: str) -> None:
+    set_state(f"mode:{series}", mode)
+    log_line("info", f"{series} mode set to {mode}")
 
 
 def log_line(level: str, message: str) -> None:
