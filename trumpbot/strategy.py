@@ -332,8 +332,8 @@ class Engine:
             elif filled_now:
                 placed += 1
                 log.info("[%s/%s] crossed NO %.2f x %g on %s", series, mode, price, count, ticker)
-                self.notify(f"LIVE FILL ({series}) {ticker} NO {price:.2f} (at place)")
-
+                word = m.get("yes_sub_title") or m.get("subtitle") or ticker
+                self.notify(f"LIVE FILL ({series}) {word}\n{ticker} NO {price:.2f} (at place)")
         if placed:
             ev = store.get_event(event_ticker) or {}
             store.mark_event(event_ticker,
@@ -461,10 +461,11 @@ class Engine:
                 store.log_line("fill", f"[{ev['series']}/DRY] PAPER FILL {row['market_ticker']} "
                                        f"NO {limit:.2f} x {float(row['count']):g} "
                                        f"(book offered {ask:.2f})")
-                self.notify(f"FILL ({ev['series']}) [DRY] {row['market_ticker']}\n"
+                word = row.get("market_title") or row["market_ticker"]
+                self.notify(f"FILL ({ev['series']}) [DRY] {word}\n"
+                            f"{row['market_ticker']}\n"
                             f"NO {limit:.2f} x {float(row['count']):g}\n"
                             f"Book was offering NO at {ask:.2f}")
-
     def check_live_fills(self, ev: Dict[str, Any]) -> None:
         for row in store.resting_orders(ev["event_ticker"], mode=config.MODE_LIVE):
             if not row.get("order_id"):
@@ -483,8 +484,11 @@ class Engine:
                                fill_price=price)
             store.log_line("fill", f"[{ev['series']}/LIVE] LIVE FILL {row['market_ticker']} "
                                    f"NO {price:.2f}")
-            self.notify(f"LIVE FILL ({ev['series']}) {row['market_ticker']} NO {price:.2f}")
-
+            word = row.get("market_title") or row["market_ticker"]
+            self.notify(
+                f"LIVE FILL ({ev['series']}) {word}\n"
+                f"{row['market_ticker']} NO {price:.2f}"
+            )
     # ------------------------------------------------------------- cancel ---
 
     def cancel_event(self, ev: Dict[str, Any], reason: str = "") -> None:
