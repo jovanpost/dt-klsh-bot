@@ -48,13 +48,11 @@ def _cutoff_listed_utc():
     raw = getattr(config, "CUTOFF_LISTED_CT", None)
     if not raw:
         return None
-    dt = clock.parse_when_clock(str(raw), "central") if hasattr(clock, "parse_when_clock") else None
-    if dt is not None:
-        return clock.to_utc(dt)
+    text = str(raw).strip()
     try:
         from zoneinfo import ZoneInfo
-        naive = datetime.strptime(str(raw), "%Y-%m-%d %H:%M:%S")
-        return naive.replace(tzinfo=ZoneInfo("America/Chicago"))
+        naive = datetime.strptime(text[:19], "%Y-%m-%d %H:%M:%S")
+        return clock.to_utc(naive.replace(tzinfo=ZoneInfo("America/Chicago")))
     except Exception:
         return None
 
