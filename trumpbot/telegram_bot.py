@@ -53,6 +53,10 @@ def send(message: str) -> None:
             log.warning("Telegram send failed: %s", exc)
 
 
+def log_notify_on() -> bool:
+    return store.get_state("notify_log", "0") == "1"
+
+
 def _resolve_series(name: str) -> Optional[str]:
     want = (name or "").strip().upper()
     if not want:
@@ -149,7 +153,7 @@ def ready_text(target: Optional[str] = None) -> str:
     rows, events, idx = _orders_and_events()
     cfgs = config.series_config()
     picks = [target] if target else [s for s, c in cfgs.items()
-                                     if c["mode"] != config.MODE_OFF]
+                                     if c["mode"] == config.MODE_DRY]
     out = []
     for s in sorted(picks):
         cfg = cfgs.get(s)
@@ -158,16 +162,46 @@ def ready_text(target: Optional[str] = None) -> str:
         srows = analytics.filter_orders(rows, series=s, mode=cfg["mode"],
                                         first_list_only=True, events_by_ticker=idx)
         rd = analytics.readiness(s, srows, events)
-        out.append(f"{s} [{rd['mode']}/{rd['family']}] {rd['passed']}/{rd['total']} gates")
+        smoke = "SMOKE ok" if rd.get("smoke_ready") else "smoke no"
+        size = "SIZE ok" if rd.get("size_ready") else "size no"
+        tag = "SIX" if rd.get("is_six") else "fam"
+        out.append(f"{s} [{rd['mode']}/{rd['family']}/{tag}] "
+                   f"{rd['passed']}/{rd['total']} {smoke} / {size}")
         if target:
+            out.append(f"   path: {rd.get('path')}")
+            out.append("   $0.25 smoke gates:")
             for g in rd["gates"]:
                 out.append(f"   {'OK ' if g['ok'] else '.. '}{g['name']}: "
                            f"{g['have']} / {g['need']}")
+            out.append("   family size-up (real dollars):")
+            for g in rd.get("family_gates") or []:
+                out.append(f"   {'OK ' if g['ok'] else '.. '}{g['name']}: "
+                           f"{g['have']} / {g['need']}")
     if not out:
-        return "No active series."
+        return "No DRY series."
     out.append("")
-    out.append("All gates green means the conversation is worth having, "
-               "not that you should flip the switch.")
+    out.append("SMOKE ok = talk $0.25 LIVE on that ticker only.")
+    out.append("SIZE ok = family tape allows real size. Smoke never implies size.")
+    out.append("/mode SERIES LIVE still needs the confirm code.")
+    return "\n".join(out)
+
+
+def logstatus_text() -> str:
+    counts = analytics.log_family_counts()
+    due = {d["family"]: d for d in analytics.log_reviews_due()}
+    out = ["LOG review (research chat, not /mode DRY):"]
+    if not counts:
+        out.append("  no LOG events logged yet")
+    for fam, n in sorted(counts.items()):
+        mark = due.get(fam)
+        extra = (f"  << due ({mark['reason']}, +{mark['added']})"
+                 if mark else "")
+        out.append(f"  {fam}: {n} events{extra}")
+    out.append("")
+    out.append(f"Ping at +{config.LOG_REVIEW_EVENTS} events or "
+               f"{config.LOG_REVIEW_DAYS}d with "
+               f"+{config.LOG_REVIEW_MIN_EVENTS}.")
+    out.append("/logreviewed FAMILY after you run the backtest.")
     return "\n".join(out)
 
 
@@ -399,7 +433,11 @@ def _handle_when(arg: str) -> None:
 
 HELP = """Commands:
 /status  - family rollup, open events, next cancels, fills today
-/ready   - gates toward LIVE; /ready SERIES for the detail
+/ready   - $0.25 smoke + family size-up; /ready SERIES for the detail
+/logstatus - LOG families: when to re-run research for DRY
+/logreviewed FAMILY - mark that research review done
+/mute LOG - silence NEW EVENT / TIME / CLOSED on LOG series (default)
+/unmute LOG - turn those back on
 /mode    - series and family modes; /mode <SERIES|FAMILY> LIVE|DRY|LOG|OFF
 /series  - every series with mode, price and size; /series FAMILY to filter
 /kill    - kill-switch state per family
@@ -459,6 +497,27 @@ class Listener(threading.Thread):
                 send(status_text())
             elif cmd == "/ready":
                 send(ready_text(_resolve_series(arg) if arg else None))
+            elif cmd == "/logstatus":
+                send(logstatus_text())
+            elif cmd == "/logreviewed":
+                fam = _resolve_family(arg) if arg else None
+                if not fam:
+                    send("Usage: /logreviewed EARNINGS")
+                    return
+                n = analytics.mark_log_reviewed(fam)
+                send(f"{fam}: review marked. Baseline {n} LOG events.")
+            elif cmd == "/mute":
+                if arg.strip().upper() == "LOG":
+                    store.set_state("notify_log", "0")
+                    send("LOG Telegram muted. DRY/LIVE and RESEARCH REVIEW still ping.")
+                else:
+                    send("Usage: /mute LOG")
+            elif cmd == "/unmute":
+                if arg.strip().upper() == "LOG":
+                    store.set_state("notify_log", "1")
+                    send("LOG Telegram unmuted. You will get NEW EVENT on LOG series.")
+                else:
+                    send("Usage: /unmute LOG")
             elif cmd == "/mode":
                 _handle_mode(arg)
             elif cmd == "/series":
