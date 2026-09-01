@@ -24,20 +24,12 @@ import threading
 import time
 from typing import Any, Dict, Optional
 
-# ------------------------------------------------------------------- modes ---
-
 MODE_LIVE = "LIVE"
 MODE_DRY = "DRY"
 MODE_LOG = "LOG"
 MODE_OFF = "OFF"
 MODES = (MODE_LIVE, MODE_DRY, MODE_LOG, MODE_OFF)
 PLACING_MODES = (MODE_LIVE, MODE_DRY)
-
-
-# ---------------------------------------------------------------- families ---
-# base_price is the family's centre; each series gets a deterministic offset
-# inside +/- JITTER_SPREAD so the book is not a wall of identical orders.
-# exp_fill / exp_p_no are the backtest yardsticks for the dashboard.
 
 FAMILY_DEFAULTS: Dict[str, Dict[str, Any]] = {
     "POLITICIAN":      {"base_price": 0.30, "mode": MODE_DRY, "dollars": 1.00,
@@ -48,13 +40,10 @@ FAMILY_DEFAULTS: Dict[str, Dict[str, Any]] = {
                         "exp_fill": 0.55, "exp_p_no": 0.702},
     "EARNINGS":        {"base_price": 0.20, "mode": MODE_LOG, "dollars": 1.00,
                         "exp_fill": 0.52, "exp_p_no": 0.509},
-    # Sports failed as a block, but the block is incoherent: MLB lost 47.9
-    # while World Cup made 41.2 at 0.30. Split, both LOG, judge separately.
     "SPORTS_ANNOUNCER": {"base_price": None, "mode": MODE_LOG, "dollars": 1.00,
                          "exp_fill": None, "exp_p_no": None},
     "SPORTS_EVENT":     {"base_price": None, "mode": MODE_LOG, "dollars": 1.00,
                          "exp_fill": None, "exp_p_no": None},
-    # Negative at every price. Do not trade.
     "HEARING":         {"base_price": None, "mode": MODE_LOG, "dollars": 1.00,
                         "exp_fill": None, "exp_p_no": 0.473},
     "BUSINESS":        {"base_price": None, "mode": MODE_LOG, "dollars": 1.00,
@@ -64,21 +53,12 @@ FAMILY_DEFAULTS: Dict[str, Dict[str, Any]] = {
 }
 FAMILIES = tuple(FAMILY_DEFAULTS.keys())
 
-JITTER_SPREAD = 0.02      # +/- 2 cents around the family base
+JITTER_SPREAD = 0.02
 JITTER_STEP = 0.01
-
-# One stake regime. Every series in DRY or LOG rests $1 per market, whatever
-# its family or price. Mixed stakes would make cross-family dollar P/L
-# meaningless, so there is only one number here.
 DRY_STAKE = 1.00
-
-# First LIVE sizing. Not applied by anything -- recorded so the plan does not
-# drift. Going live is a per-series decision plus an explicit stake change.
 LIVE_FIRST_STAKE = 0.25
 LIVE_FIRST_BANK = 150.00
 
-# Seeded into tm_series on first boot only. After that the DB row wins and
-# this dict is ignored, so editing it will not retune a running series.
 SEED_SERIES: Dict[str, Dict[str, Any]] = {
     "KXTRUMPMENTIONB": {"family": "POLITICIAN", "mode": MODE_DRY, "dollars": 1.00},
     "KXTRUMPMENTION":  {"family": "POLITICIAN", "mode": MODE_DRY, "dollars": 1.00},
@@ -86,7 +66,6 @@ SEED_SERIES: Dict[str, Dict[str, Any]] = {
                            "notes": "handled by wnt-nofade-bot; do not enable"},
 }
 
-# Poll cadences, seconds.
 TICK_SECONDS = 5
 DISCOVERY_SECONDS = 45
 SETTLE_SECONDS = 3600
@@ -100,7 +79,6 @@ DISCOVERY_INTERVAL_BY_MODE = {
 }
 DISCOVERY_MAX_SERIES_PER_TICK = 8
 
-# Events Kalshi listed before this Chicago instant are ignored (no rest).
 CUTOFF_LISTED_CT = "2026-09-01 00:00:00"
 
 FIRST_LIST_GRACE_SECONDS = 180
@@ -110,6 +88,38 @@ ORPHAN_HOURS = 48
 
 KILL_ALERT_FILLS = 20
 KILL_REVERT_FILLS = 50
+
+SMOKE_SIX = frozenset({
+    "KXTRUMPMENTIONB",
+    "KXMAMDANIMENTION",
+    "KXLASTWORDMENTION",
+    "KXFOXNEWSMENTION",
+    "KXLOVEISLMENTION",
+    "KXLATENIGHTMENTION",
+})
+
+SMOKE_SIX_EVENTS = 3
+SMOKE_SIX_FILLS = 12
+SMOKE_SIX_DAYS = 2
+SMOKE_SIX_EVENTS_WITH_FILLS = 2
+SMOKE_SIX_CUSHION = 0.05
+SMOKE_SIX_FILL_RATIO = 0.50
+
+SMOKE_OTHER_EVENTS = 5
+SMOKE_OTHER_FILLS = 15
+SMOKE_OTHER_DAYS = 3
+SMOKE_OTHER_EVENTS_WITH_FILLS = 3
+
+SIZE_EVENTS = 50
+SIZE_FILLS = 50
+SIZE_DAYS = 10
+SIZE_CUSHION = 0.03
+SIZE_FILL_RATIO = 0.70
+
+LOG_REVIEW_EVENTS = 25
+LOG_REVIEW_DAYS = 90
+LOG_REVIEW_MIN_EVENTS = 5
+LOG_REVIEW_SECONDS = 3600
 
 LIVE_COUNT_MODE = "raw"
 TABLE_PREFIX = "tm_"
