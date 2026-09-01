@@ -693,6 +693,50 @@ class Engine:
                 self.log_review_nag()
             except Exception as exc:
                 log.warning("LOG review check failed: %s", exc)
+            try:
+                self.ready_nag()
+            except Exception as exc:
+                log.warning("Ready nag failed: %s", exc)
+
+    def ready_nag(self) -> None:
+        """One Telegram when $0.25 smoke or family size-up first becomes true."""
+        rows = store.orders_for_dashboard(limit=20000)
+        events = store.all_events(limit=2000)
+        idx = analytics.event_index(events)
+        sized = set()
+        for s, cfg in config.series_config().items():
+            if cfg["mode"] != config.MODE_DRY:
+                continue
+            srows = analytics.filter_orders(
+                rows, series=s, mode=config.MODE_DRY,
+                first_list_only=True, events_by_ticker=idx)
+            rd = analytics.readiness(s, srows, events)
+            if rd.get("smoke_ready"):
+                key = f"ready_ping:smoke:{s}"
+                if not store.get_state(key):
+                    store.set_state(key, clock.now_utc().isoformat())
+                    tag = "SIX" if rd.get("is_six") else "fam"
+                    self.notify(
+                        f"SMOKE READY ({s}) [{rd.get('mode')}/{rd.get('family')}/{tag}]\n"
+                        f"Path: {rd.get('path')}\n"
+                        f"$0.25 LIVE conversation is allowed on this ticker only.\n"
+                        f"Does NOT mean size-up. Does NOT flip LIVE.\n"
+                        f"/ready {s}\n"
+                        f"/mode {s} LIVE"
+                    )
+            fam = cfg["family"]
+            if rd.get("size_ready") and fam not in sized:
+                sized.add(fam)
+                key = f"ready_ping:size:{fam}"
+                if not store.get_state(key):
+                    store.set_state(key, clock.now_utc().isoformat())
+                    self.notify(
+                        f"SIZE READY ({fam})\n"
+                        f"Family first-list DRY tape cleared 50/50/10 + cushion "
+                        f"+ fill + bootstrap.\n"
+                        f"Real-size conversation is allowed. Smoke never implied this.\n"
+                        f"/ready {s}"
+                    )
 
     def log_review_nag(self) -> None:
         for d in analytics.log_reviews_due():
