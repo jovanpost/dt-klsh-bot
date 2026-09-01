@@ -1,13 +1,4 @@
-"""Analytics shared by the dashboard, Telegram and the kill switch.
-
-One place computes these numbers so the page and the bot can never disagree.
-
-Two rules the research paid for:
-  * Report the day-clustered bootstrap lower bound, never the per-event mean.
-    Events on the same day are correlated; per-event confidence is fiction.
-  * Never mix modes, and never mix first-list events with mid-event joins.
-    A mid-join tape is a different measurement, not a bad day.
-"""
+"""Analytics shared by the dashboard, Telegram and the kill switch."""
 from __future__ import annotations
 
 import random
@@ -56,16 +47,13 @@ def stats(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     fills = [r for r in rows if r.get("status") == "filled"]
     settled = [r for r in fills if r.get("result")]
     wins = [r for r in settled if r["result"] == "no"]
-
     staked = sum(float(r.get("dollars") or 0) for r in settled)
     pnl = sum(float(r.get("pnl") or 0) for r in settled)
     contracts = sum(float(r.get("count") or 0) for r in settled)
-
     prices = [float(r["limit_price"]) for r in rows
               if r.get("limit_price") is not None]
     avg_price = sum(prices) / len(prices) if prices else None
     p_no = (len(wins) / len(settled)) if settled else None
-
     return {
         "orders": orders,
         "fills": len(fills),
@@ -141,76 +129,226 @@ def day_summary(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 MIN_EVENTS_DRY = 25
-MIN_EVENTS_LIVE = 50
-MIN_SETTLED_FILLS = 50
-MIN_SETTLED_DAYS = 10
-MIN_CUSHION = 0.03
-FILL_RATE_FLOOR = 0.70
+MIN_EVENTS_LIVE = config.SIZE_EVENTS
+MIN_SETTLED_FILLS = config.SIZE_FILLS
+MIN_SETTLED_DAYS = config.SIZE_DAYS
+MIN_CUSHION = config.SIZE_CUSHION
+FILL_RATE_FLOOR = config.SIZE_FILL_RATIO
+
+
+def _gate(name, ok, have, need, note=""):
+    prog = None
+    if isinstance(have, (int, float)) and isinstance(need, (int, float)) and need:
+        prog = max(0.0, min(1.0, float(have) / float(need)))
+    return {"name": name, "ok": bool(ok), "have": have, "need": need,
+            "note": note, "progress": prog}
+
+
+def events_with_settled_fills(rows: List[Dict[str, Any]]) -> int:
+    return len({r.get("event_ticker") for r in rows
+                if r.get("status") == "filled" and r.get("result") and r.get("event_ticker")})
+
+
+def family_first_list_rows(family: str, rows: List[Dict[str, Any]],
+                           events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    idx = event_index(events)
+    return filter_orders(rows, family=family, first_list_only=True,
+                         events_by_ticker=idx)
+
+
+def family_unlocked(family: str, rows: List[Dict[str, Any]],
+                    events: List[Dict[str, Any]]) -> Dict[str, Any]:
+    frows = [r for r in family_first_list_rows(family, rows, events)
+             if r.get("mode") == config.MODE_DRY]
+    fl_events = [e for e in events
+                 if e.get("family") == family and e.get("discovered_at_open")
+                 and e.get("mode") == config.MODE_DRY]
+    if not fl_events:
+        members = set(config.series_in_family(family).keys())
+        fl_events = [e for e in events
+                     if e.get("series") in members and e.get("discovered_at_open")
+                     and e.get("mode") == config.MODE_DRY]
+        frows = filter_orders(rows, first_list_only=True,
+                              events_by_ticker=event_index(events))
+        frows = [r for r in frows if r.get("series") in members
+                 and r.get("mode") == config.MODE_DRY]
+    st = stats(frows)
+    ds = day_summary(frows)
+    fam = config.FAMILY_DEFAULTS.get(family, {})
+    exp_fill = fam.get("exp_fill")
+    cushion = st["cushion"]
+    ratio = (st["fill_rate"] / exp_fill) if (exp_fill and st["fill_rate"] is not None) else None
+    low = ds["boot_low"]
+    gates = [
+        _gate("Family first-list events", len(fl_events) >= config.SIZE_EVENTS,
+              len(fl_events), config.SIZE_EVENTS, "pooled DRY first-list"),
+        _gate("Family settled fills", st["settled"] >= config.SIZE_FILLS,
+              st["settled"], config.SIZE_FILLS),
+        _gate("Family settled days", ds["settled_days"] >= config.SIZE_DAYS,
+              ds["settled_days"], config.SIZE_DAYS),
+        _gate("Family cushion >= 0.03",
+              cushion is not None and cushion >= config.SIZE_CUSHION,
+              None if cushion is None else round(cushion, 3), config.SIZE_CUSHION),
+        _gate("Family fill vs backtest",
+              ratio is not None and ratio >= config.SIZE_FILL_RATIO,
+              None if ratio is None else round(ratio, 2), config.SIZE_FILL_RATIO),
+        _gate("Family day bootstrap > 0", low is not None and low > 0,
+              None if low is None else round(low, 3), 0.0),
+    ]
+    return {
+        "family": family,
+        "unlocked": all(g["ok"] for g in gates),
+        "gates": gates,
+        "stats": st,
+        "day": ds,
+        "events_first_list": len(fl_events),
+    }
 
 
 def readiness(series: str, rows: List[Dict[str, Any]],
               events: List[Dict[str, Any]]) -> Dict[str, Any]:
     cfg = config.series_cfg(series) or {}
+    family = cfg.get("family") or "OTHER"
     mine = [e for e in events if e.get("series") == series]
     first_list = [e for e in mine if e.get("discovered_at_open")]
-
     st = stats(rows)
     ds = day_summary(rows)
     exp_fill = cfg.get("exp_fill_rate")
+    price = cfg.get("rest_price")
+    p_no = st["p_no"]
+    cushion = st["cushion"]
+    n_ev_fills = events_with_settled_fills(rows)
+    is_six = series in config.SMOKE_SIX
+    from . import store
+    all_rows = store.orders_for_dashboard(limit=20000)
+    all_events = store.all_events(limit=2000)
+    fam_state = family_unlocked(family, all_rows, all_events)
 
     gates: List[Dict[str, Any]] = []
+    gates.append(_gate("Mode is DRY", cfg.get("mode") == config.MODE_DRY,
+                       cfg.get("mode"), "DRY",
+                       "LOG records only. LIVE is gated here."))
 
-    def gate(name, ok, have, need, note=""):
-        gates.append({"name": name, "ok": bool(ok), "have": have,
-                      "need": need, "note": note,
-                      "progress": None if not isinstance(have, (int, float))
-                      or not isinstance(need, (int, float)) or not need
-                      else max(0.0, min(1.0, float(have) / float(need)))})
-
-    gate("Mode is DRY", cfg.get("mode") == config.MODE_DRY,
-         cfg.get("mode"), "DRY",
-         "LOG series record only; LIVE is the thing we are gating")
-    gate("First-list events", len(first_list), len(first_list), MIN_EVENTS_LIVE,
-         "mid-event joins do not count")
-    gate("Settled fills", st["settled"], st["settled"], MIN_SETTLED_FILLS)
-    gate("Settled days", ds["settled_days"], ds["settled_days"], MIN_SETTLED_DAYS)
-
-    cushion = st["cushion"]
-    gate("P(No|filled) clears price",
-         cushion is not None and cushion >= MIN_CUSHION,
-         None if cushion is None else round(cushion, 3), MIN_CUSHION,
-         "P(No|filled) minus the price paid")
-
-    if exp_fill and st["fill_rate"] is not None:
-        ratio = st["fill_rate"] / exp_fill
-        gate("Fill rate vs backtest", ratio >= FILL_RATE_FLOOR,
-             round(ratio, 2), FILL_RATE_FLOOR,
-             "low means you are behind other resting orders in the queue")
+    if is_six:
+        path = "six-name smoke (BUSINESS)"
+        gates.append(_gate("First-list events", len(first_list) >= config.SMOKE_SIX_EVENTS,
+                           len(first_list), config.SMOKE_SIX_EVENTS,
+                           "mid-joins do not count"))
+        gates.append(_gate("Settled fills", st["settled"] >= config.SMOKE_SIX_FILLS,
+                           st["settled"], config.SMOKE_SIX_FILLS))
+        gates.append(_gate("Settled days", ds["settled_days"] >= config.SMOKE_SIX_DAYS,
+                           ds["settled_days"], config.SMOKE_SIX_DAYS))
+        gates.append(_gate("Events that produced fills",
+                           n_ev_fills >= config.SMOKE_SIX_EVENTS_WITH_FILLS,
+                           n_ev_fills, config.SMOKE_SIX_EVENTS_WITH_FILLS,
+                           "not 12 fills from one show"))
+        need_cush = config.SMOKE_SIX_CUSHION
+        gates.append(_gate("Cushion >= price+0.05",
+                           cushion is not None and cushion >= need_cush,
+                           None if cushion is None else round(cushion, 3), need_cush,
+                           "BUSINESS filter; 12 fills are not an edge test"))
+        if exp_fill and st["fill_rate"] is not None:
+            ratio = st["fill_rate"] / exp_fill
+            gates.append(_gate("Fill rate vs backtest",
+                               ratio >= config.SMOKE_SIX_FILL_RATIO,
+                               round(ratio, 2), config.SMOKE_SIX_FILL_RATIO))
+        else:
+            gates.append(_gate("Fill rate vs backtest", False, "no baseline",
+                               config.SMOKE_SIX_FILL_RATIO))
     else:
-        gate("Fill rate vs backtest", False, "no baseline", FILL_RATE_FLOOR,
-             "family has no published expectation")
+        path = "series smoke after family unlock (BUSINESS)"
+        gates.append(_gate("Family unlocked for smoke", fam_state["unlocked"],
+                           "yes" if fam_state["unlocked"] else "no", "yes",
+                           "family 50/50/10 + cushion + fill + boot>0"))
+        gates.append(_gate("First-list events", len(first_list) >= config.SMOKE_OTHER_EVENTS,
+                           len(first_list), config.SMOKE_OTHER_EVENTS,
+                           "full tape since Sep 1, no reset at unlock"))
+        gates.append(_gate("Settled fills", st["settled"] >= config.SMOKE_OTHER_FILLS,
+                           st["settled"], config.SMOKE_OTHER_FILLS))
+        gates.append(_gate("Settled days", ds["settled_days"] >= config.SMOKE_OTHER_DAYS,
+                           ds["settled_days"], config.SMOKE_OTHER_DAYS))
+        gates.append(_gate("Events that produced fills",
+                           n_ev_fills >= config.SMOKE_OTHER_EVENTS_WITH_FILLS,
+                           n_ev_fills, config.SMOKE_OTHER_EVENTS_WITH_FILLS))
+        ok_be = p_no is not None and price is not None and p_no >= float(price)
+        gates.append(_gate("P(No|filled) >= price",
+                           ok_be,
+                           None if p_no is None else round(p_no, 3),
+                           None if price is None else float(price),
+                           "not losing on this ticker"))
 
-    low = ds["boot_low"]
-    gate("Day bootstrap low > 0", low is not None and low > 0,
-         None if low is None else round(low, 3), 0.0,
-         "95% lower bound on mean $/day, resampling whole days")
-
-    passed = sum(1 for g in gates if g["ok"])
+    smoke_ready = all(g["ok"] for g in gates)
     return {
         "series": series,
-        "family": cfg.get("family"),
+        "family": family,
         "mode": cfg.get("mode"),
-        "price": cfg.get("rest_price"),
+        "price": price,
         "dollars": cfg.get("dollars"),
+        "path": path,
+        "is_six": is_six,
         "gates": gates,
-        "passed": passed,
+        "passed": sum(1 for g in gates if g["ok"]),
         "total": len(gates),
-        "ready": passed == len(gates),
+        "ready": smoke_ready,
+        "smoke_ready": smoke_ready,
+        "size_ready": fam_state["unlocked"] and cfg.get("mode") == config.MODE_DRY,
+        "family_unlocked": fam_state["unlocked"],
+        "family_gates": fam_state["gates"],
         "stats": st,
         "day": ds,
         "events_seen": len(mine),
         "events_first_list": len(first_list),
+        "events_with_fills": n_ev_fills,
     }
+
+
+def log_family_counts(events: Optional[List[Dict[str, Any]]] = None) -> Dict[str, int]:
+    if events is None:
+        from . import store
+        events = store.all_events(limit=5000)
+    log_series = {s for s, c in config.series_config().items()
+                  if c["mode"] == config.MODE_LOG}
+    out: Dict[str, int] = {}
+    for e in events:
+        s = e.get("series")
+        if s not in log_series:
+            continue
+        fam = (config.series_cfg(s) or {}).get("family") or e.get("family") or "OTHER"
+        out[fam] = out.get(fam, 0) + 1
+    return out
+
+
+def log_reviews_due(events: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
+    from . import store
+    counts = log_family_counts(events)
+    now = clock.now_utc()
+    due = []
+    for fam, n in sorted(counts.items()):
+        raw = store.get_state(f"log_review:{fam}") or ""
+        last_n, _, when = raw.partition("|")
+        try:
+            last_n_i = int(last_n)
+        except ValueError:
+            last_n_i = 0
+        last_at = clock.parse_iso(when) if when else None
+        added = n - last_n_i
+        age_days = ((now - last_at).total_seconds() / 86400.0) if last_at else None
+        hit_events = added >= config.LOG_REVIEW_EVENTS
+        hit_time = (last_at is not None
+                    and age_days >= config.LOG_REVIEW_DAYS
+                    and added >= config.LOG_REVIEW_MIN_EVENTS)
+        if hit_events or hit_time:
+            due.append({"family": fam, "events": n, "added": added,
+                        "days": None if last_at is None else round(age_days, 1),
+                        "reason": "25 events" if hit_events else "90 days"})
+    return due
+
+
+def mark_log_reviewed(family: str, events: Optional[List[Dict[str, Any]]] = None) -> int:
+    from . import store
+    n = log_family_counts(events).get(family, 0)
+    store.set_state(f"log_review:{family}", f"{n}|{clock.now_utc().isoformat()}")
+    return n
 
 
 def kill_check(family: str, mode: str = config.MODE_LIVE) -> Dict[str, Any]:
@@ -226,7 +364,6 @@ def kill_check(family: str, mode: str = config.MODE_LIVE) -> Dict[str, Any]:
     prices = [float(r["limit_price"]) for r in rows if r.get("limit_price")]
     breakeven = sum(prices) / len(prices) if prices else None
     cushion = (p_no - breakeven) if breakeven is not None else None
-
     state = "ok"
     if breakeven is not None and p_no < breakeven:
         if n >= config.KILL_REVERT_FILLS:
