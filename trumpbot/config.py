@@ -1,40 +1,28 @@
 """Configuration.
 
-Per-series run modes replace the global DRY_RUN boolean.
+Series live in the database (tm_series), not in a 180-entry Python dict.
+This module is the reader: it merges the DB rows over the bootstrap defaults
+below and hands the engine one dict per series.
 
-    LIVE  place real orders, real fills, real money
-    DRY   place nothing real; simulate fills by watching the book
-    LOG   record events, markets and prices only; no orders, no fills
+    LIVE  real orders, real money
+    DRY   no orders; simulate fills by watching the book
+    LOG   record events, markets and quotes only
     OFF   ignore the series entirely
 
-Mode resolution order, highest wins:
-    1. the DB (set by Telegram /mode) -- survives a Streamlit reboot
-    2. Secrets  [series.X] mode = "DRY"
-    3. DEFAULT_SERIES below
+Resolution order for any series field: tm_series row, then FAMILY_DEFAULTS,
+then the hard defaults here. Mode always comes from the DB once a row exists,
+so a Streamlit reboot cannot silently reset a series.
 
-Prices and sizes are NOT touched by a mode change. Moving a series to LIVE
-never implicitly retunes anything.
-
-Secrets shape (TOML):
-
-    KALSHI_KEY_ID = "..."
-    KALSHI_PRIVATE_KEY = \"\"\"-----BEGIN RSA PRIVATE KEY-----
-    ...
-    -----END RSA PRIVATE KEY-----\"\"\"
-    DATABASE_URL = "postgresql://postgres.xxxx:PASSWORD@aws-0-us-east-1.pooler.supabase.com:5432/postgres"
-    TELEGRAM_TOKEN = "..."
-    TELEGRAM_CHAT_ID = "..."
-
-    [series.KXTRUMPMENTIONB]
-    mode = "DRY"
-    rest_price = 0.35
-    dollars = 3.00
-    buffer_min = 5
+PRICE IS PER FAMILY, NEVER GLOBAL. Sports loses money at 0.30 and makes money
+at 0.15-0.20; a single global price would be a losing bet on half the book.
 """
 from __future__ import annotations
 
+import hashlib
 import os
-from typing import Any, Dict
+import threading
+import time
+from typing import Any, Dict, Optional
 
 # ------------------------------------------------------------------- modes ---
 
@@ -43,62 +31,93 @@ MODE_DRY = "DRY"
 MODE_LOG = "LOG"
 MODE_OFF = "OFF"
 MODES = (MODE_LIVE, MODE_DRY, MODE_LOG, MODE_OFF)
-
-# Modes that create order rows of any kind.
 PLACING_MODES = (MODE_LIVE, MODE_DRY)
 
 
-# ---------------------------------------------------------------- defaults ---
+# ---------------------------------------------------------------- families ---
+# base_price is the family's centre; each series gets a deterministic offset
+# inside +/- JITTER_SPREAD so the book is not a wall of identical orders.
+# exp_fill / exp_p_no are the backtest yardsticks for the dashboard.
 
-DEFAULT_SERIES: Dict[str, Dict[str, Any]] = {
-    "KXTRUMPMENTIONB": {
-        "mode": MODE_DRY,
-        "rest_price": 0.35,
-        "dollars": 3.00,
-        "buffer_min": 5,
-        # Clean-clock expectations (handoff v2). The old 0.657 / 0.605 came
-        # from a cancel anchor that ran through the appearance and counted
-        # on-air fills the bot could never take.
-        "exp_fill_rate": 0.522,
-        "exp_p_no_given_filled": 0.579,
-    },
-    "KXTRUMPMENTION": {
-        "mode": MODE_DRY,
-        "rest_price": 0.25,
-        "dollars": 3.00,
-        "buffer_min": 5,
-        # No clean-clock fill rate or P(No|filled) was published for A.
-        # Left as None rather than carrying the discredited 0.671 / 0.318.
-        "exp_fill_rate": None,
-        "exp_p_no_given_filled": None,
-    },
+FAMILY_DEFAULTS: Dict[str, Dict[str, Any]] = {
+    "POLITICIAN":      {"base_price": 0.30, "mode": MODE_DRY, "dollars": 1.00,
+                        "exp_fill": 0.51, "exp_p_no": 0.603},
+    "NEWS_SHOW":       {"base_price": 0.30, "mode": MODE_DRY, "dollars": 1.00,
+                        "exp_fill": 0.52, "exp_p_no": 0.618},
+    "ENTERTAINMENT":   {"base_price": 0.30, "mode": MODE_DRY, "dollars": 1.00,
+                        "exp_fill": 0.55, "exp_p_no": 0.702},
+    "EARNINGS":        {"base_price": 0.20, "mode": MODE_LOG, "dollars": 1.00,
+                        "exp_fill": 0.52, "exp_p_no": 0.509},
+    # Sports failed as a block, but the block is incoherent: MLB lost 47.9
+    # while World Cup made 41.2 at 0.30. Split, both LOG, judge separately.
+    "SPORTS_ANNOUNCER": {"base_price": None, "mode": MODE_LOG, "dollars": 1.00,
+                         "exp_fill": None, "exp_p_no": None},
+    "SPORTS_EVENT":     {"base_price": None, "mode": MODE_LOG, "dollars": 1.00,
+                         "exp_fill": None, "exp_p_no": None},
+    # Negative at every price. Do not trade.
+    "HEARING":         {"base_price": None, "mode": MODE_LOG, "dollars": 1.00,
+                        "exp_fill": None, "exp_p_no": 0.473},
+    "BUSINESS":        {"base_price": None, "mode": MODE_LOG, "dollars": 1.00,
+                        "exp_fill": None, "exp_p_no": None},
+    "OTHER":           {"base_price": 0.30, "mode": MODE_LOG, "dollars": 1.00,
+                        "exp_fill": None, "exp_p_no": None},
+}
+FAMILIES = tuple(FAMILY_DEFAULTS.keys())
+
+JITTER_SPREAD = 0.02      # +/- 2 cents around the family base
+JITTER_STEP = 0.01
+
+# One stake regime. Every series in DRY or LOG rests $1 per market, whatever
+# its family or price. Mixed stakes would make cross-family dollar P/L
+# meaningless, so there is only one number here.
+DRY_STAKE = 1.00
+
+# First LIVE sizing. Not applied by anything -- recorded so the plan does not
+# drift. Going live is a per-series decision plus an explicit stake change.
+LIVE_FIRST_STAKE = 0.25
+LIVE_FIRST_BANK = 150.00
+
+# Seeded into tm_series on first boot only. After that the DB row wins and
+# this dict is ignored, so editing it will not retune a running series.
+SEED_SERIES: Dict[str, Dict[str, Any]] = {
+    "KXTRUMPMENTIONB": {"family": "POLITICIAN", "mode": MODE_DRY, "dollars": 1.00},
+    "KXTRUMPMENTION":  {"family": "POLITICIAN", "mode": MODE_DRY, "dollars": 1.00},
+    "KXWORLDNEWSMENTION": {"family": "NEWS_SHOW", "mode": MODE_OFF, "dollars": 1.00,
+                           "notes": "handled by wnt-nofade-bot; do not enable"},
 }
 
 # Poll cadences, seconds.
-TICK_SECONDS = 5              # main loop heartbeat
-DISCOVERY_SECONDS = 45        # look for brand-new events
-EVENT_POLL_SECONDS = 5        # quotes + late-market join per open event
-SETTLE_SECONDS = 3600         # settlement hunter, hourly
-TICK_LOG_SECONDS = 60         # how often to save a quote sample
+TICK_SECONDS = 5
+DISCOVERY_SECONDS = 45
+SETTLE_SECONDS = 3600
+TICK_LOG_SECONDS = 60
 
-# An event counts as "discovered at open" if we saw it within this many
-# seconds of its markets opening. Only these events belong in the clean
-# fill-rate test against 52%.
+DISCOVERY_INTERVAL_BY_MODE = {
+    MODE_LIVE: 45,
+    MODE_DRY: 45,
+    MODE_LOG: 900,
+    MODE_OFF: None,
+}
+DISCOVERY_MAX_SERIES_PER_TICK = 8
+
+# Events Kalshi listed before this Chicago instant are ignored (no rest).
+CUTOFF_LISTED_CT = "2026-09-01 00:00:00"
+
 FIRST_LIST_GRACE_SECONDS = 180
-
-# Telegram nag when an open event has neither /when nor a milestone.
 NAG_REPEAT_MINUTES = 90
-
-# Seconds a /mode LIVE confirmation code stays valid.
 LIVE_CONFIRM_TTL = 60
+ORPHAN_HOURS = 48
 
-# Live placement only. "floor" sends int(count); "raw" sends the fraction.
+KILL_ALERT_FILLS = 20
+KILL_REVERT_FILLS = 50
+
 LIVE_COUNT_MODE = "raw"
+TABLE_PREFIX = "tm_"
 
-TABLE_PREFIX = "tm_"          # keeps these tables apart from the WNT bot's
+_CACHE: Dict[str, Any] = {"series": None, "at": 0.0}
+_CACHE_TTL = 5.0
+_lock = threading.Lock()
 
-
-# ----------------------------------------------------------------- loading ---
 
 def _secrets() -> Dict[str, Any]:
     try:
@@ -109,7 +128,6 @@ def _secrets() -> Dict[str, Any]:
 
 
 def get(name: str, default: Any = None) -> Any:
-    """Secrets first, then environment, then the supplied default."""
     s = _secrets()
     if name in s:
         return s[name]
@@ -118,77 +136,147 @@ def get(name: str, default: Any = None) -> Any:
     return default
 
 
-def series_config() -> Dict[str, Dict[str, Any]]:
-    """DEFAULT_SERIES merged with any [series.X] blocks in Secrets.
-
-    This does NOT consult the DB. Use mode_for() for the effective mode.
-    """
-    merged = {k: dict(v) for k, v in DEFAULT_SERIES.items()}
-    override = _secrets().get("series", {})
-    try:
-        override = dict(override)
-    except Exception:
-        override = {}
-    for ticker, vals in override.items():
-        base = merged.get(ticker, {})
-        base.update(dict(vals))
-        # Migration: an old `enabled = false` means OFF.
-        if "mode" not in base and base.get("enabled") is False:
-            base["mode"] = MODE_OFF
-        merged[ticker] = base
-    return merged
-
-
 def normalize_mode(value: Any) -> str:
     v = str(value or "").strip().upper()
     return v if v in MODES else MODE_OFF
 
 
-def mode_for(series: str) -> str:
-    """Effective mode: DB override, then Secrets/defaults.
+def normalize_family(value: Any) -> str:
+    v = str(value or "").strip().upper()
+    return v if v in FAMILY_DEFAULTS else "OTHER"
 
-    store is imported lazily -- store imports config at module level, so a
-    top-level import here would be circular.
-    """
+
+def jittered_price(series: str, base: Optional[float]) -> Optional[float]:
+    if base is None:
+        return None
+    n = int(round(JITTER_SPREAD / JITTER_STEP))
+    h = int(hashlib.sha256(series.encode()).hexdigest()[:8], 16)
+    offset = (h % (2 * n + 1)) - n
+    return round(float(base) + offset * JITTER_STEP, 4)
+
+
+def _row_to_cfg(row: Dict[str, Any]) -> Dict[str, Any]:
+    family = normalize_family(row.get("family"))
+    fam = FAMILY_DEFAULTS[family]
+    price = row.get("rest_price")
+    if price is None:
+        price = jittered_price(row["series"], fam["base_price"])
+    return {
+        "series": row["series"],
+        "family": family,
+        "mode": normalize_mode(row.get("mode") or fam["mode"]),
+        "rest_price": float(price) if price is not None else None,
+        "dollars": float(row.get("dollars") if row.get("dollars") is not None
+                         else fam["dollars"]),
+        "buffer_min": int(row.get("buffer_min") or 5),
+        "enabled": bool(row.get("enabled", True)),
+        "notes": row.get("notes"),
+        "exp_fill_rate": fam["exp_fill"],
+        "exp_p_no_given_filled": fam["exp_p_no"],
+    }
+
+
+def series_config(force: bool = False) -> Dict[str, Dict[str, Any]]:
+    with _lock:
+        now = time.time()
+        if not force and _CACHE["series"] is not None and now - _CACHE["at"] < _CACHE_TTL:
+            return _CACHE["series"]
+    out: Dict[str, Dict[str, Any]] = {}
     try:
         from . import store
-        db = store.get_series_mode(series)
-        if db:
-            return normalize_mode(db)
+        for row in store.all_series():
+            out[row["series"]] = _row_to_cfg(row)
     except Exception:
         pass
+    if not out:
+        for s, vals in SEED_SERIES.items():
+            out[s] = _row_to_cfg({"series": s, **vals})
+    with _lock:
+        _CACHE["series"] = out
+        _CACHE["at"] = time.time()
+    return out
+
+
+def invalidate() -> None:
+    with _lock:
+        _CACHE["series"] = None
+
+
+def series_cfg(series: str) -> Optional[Dict[str, Any]]:
+    return series_config().get(series)
+
+
+def mode_for(series: str) -> str:
     cfg = series_config().get(series)
     if not cfg:
         return MODE_OFF
-    if "mode" not in cfg and cfg.get("enabled") is False:
+    if not cfg.get("enabled"):
         return MODE_OFF
-    return normalize_mode(cfg.get("mode", MODE_DRY))
+    return cfg["mode"]
+
+
+def family_for(series: str) -> str:
+    cfg = series_config().get(series)
+    return cfg["family"] if cfg else "OTHER"
 
 
 def all_modes() -> Dict[str, str]:
-    return {s: mode_for(s) for s in series_config()}
+    return {s: c["mode"] for s, c in series_config().items()}
+
+
+def series_in_family(family: str) -> Dict[str, Dict[str, Any]]:
+    fam = normalize_family(family)
+    return {s: c for s, c in series_config().items() if c["family"] == fam}
 
 
 def active_series() -> Dict[str, Dict[str, Any]]:
-    """Series we still discover events for. OFF is excluded."""
-    return {k: v for k, v in series_config().items()
-            if mode_for(k) != MODE_OFF}
+    return {s: c for s, c in series_config().items()
+            if c["mode"] != MODE_OFF}
 
 
 def enabled_series() -> Dict[str, Dict[str, Any]]:
-    """Kept so older call sites do not break."""
     return active_series()
 
 
-def dry_run() -> bool:
-    """Legacy shim. Modes are per series now -- prefer mode_for(series).
+def tradeable(cfg: Dict[str, Any]) -> bool:
+    return cfg.get("rest_price") is not None
 
-    True only if no series is LIVE, so anything still calling this behaves
-    conservatively rather than assuming real money.
-    """
+
+def dry_run() -> bool:
     return not any(m == MODE_LIVE for m in all_modes().values())
 
 
-def contracts_for(cfg: Dict[str, Any]) -> float:
-    """Dollars / price, rounded to 6 decimals. Fractional on purpose."""
-    return round(float(cfg["dollars"]) / float(cfg["rest_price"]), 6)
+def contracts_for(cfg: Dict[str, Any]) -> Optional[float]:
+    price = cfg.get("rest_price")
+    if not price:
+        return None
+    return round(float(cfg["dollars"]) / float(price), 6)
+
+
+def seed_series() -> int:
+    from . import store
+    added = 0
+    existing = {r["series"] for r in store.all_series()}
+    for s, vals in SEED_SERIES.items():
+        if s in existing:
+            continue
+        family = normalize_family(vals.get("family"))
+        fam = FAMILY_DEFAULTS[family]
+        legacy = store.get_state(f"mode:{s}")
+        price = vals.get("rest_price")
+        if price is None:
+            price = jittered_price(s, fam["base_price"])
+        store.upsert_series({
+            "series": s,
+            "family": family,
+            "mode": normalize_mode(legacy or vals.get("mode") or fam["mode"]),
+            "rest_price": price,
+            "dollars": vals.get("dollars", fam["dollars"]),
+            "buffer_min": vals.get("buffer_min", 5),
+            "enabled": vals.get("enabled", True),
+            "notes": vals.get("notes"),
+        })
+        added += 1
+    if added:
+        invalidate()
+    return added
