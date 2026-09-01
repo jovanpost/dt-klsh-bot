@@ -533,6 +533,9 @@ class Engine:
             + (f"\nLive cancel errors: {live_errors}" if live_errors else ""))
 
     def sample_ticks(self, ev: Dict[str, Any], markets: List[Dict[str, Any]]) -> None:
+        mode = config.normalize_mode(ev.get("mode"))
+        if mode not in config.PLACING_MODES:
+            return
         key = ev["event_ticker"]
         if _time.time() - self._last_tick_log.get(key, 0.0) < config.TICK_LOG_SECONDS:
             return
