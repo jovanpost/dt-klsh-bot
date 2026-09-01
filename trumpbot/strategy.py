@@ -413,14 +413,18 @@ class Engine:
     # --------------------------------------------------------------- nag ---
 
     def maybe_nag(self, ev: Dict[str, Any]) -> None:
-        """Tell Jovan the clock is a fallback. Nag, never hold."""
+        """Fallback clock: once at +90m, then once per 24h. Never hold orders."""
         if is_trusted(ev.get("cancel_source")):
             return
         if config.normalize_mode(ev.get("mode")) not in config.PLACING_MODES:
             return
         now = clock.now_utc()
         last = clock.to_utc(ev.get("nagged_at")) if ev.get("nagged_at") else None
-        if last and (now - last).total_seconds() < config.NAG_REPEAT_MINUTES * 60:
+        disc = clock.to_utc(ev.get("discovered_at")) if ev.get("discovered_at") else now
+        if last is None:
+            if (now - disc).total_seconds() < 90 * 60:
+                return
+        elif (now - last).total_seconds() < 24 * 3600:
             return
         ticker = ev["event_ticker"]
         store.mark_event(ticker, nagged_at=now)
@@ -431,7 +435,6 @@ class Engine:
             f"({ev.get('cancel_source') or 'none'})\n"
             f"Orders resting: {len(store.resting_orders(ticker))}\n"
             f"Check the app clock, then:\n/when {ticker} 8:00 PM central")
-
     # ------------------------------------------------------------- polling ---
 
     def _poll_interval(self, ev: Dict[str, Any]) -> int:
