@@ -135,10 +135,15 @@ class Engine:
         return anchor - timedelta(minutes=int(buffer_min)), source, occ, close
 
     def _listed_at(self, markets: List[Dict[str, Any]], ev: Dict[str, Any]):
-        """Earliest Kalshi open/created time we can find for this event."""
+        """When Kalshi created the card, not the scheduled show/open."""
         blobs = list(markets) + [ev]
-        opened, _ = self._pick_time(blobs, OPEN_FIELDS + ("created_time", "created_ts"))
-        return opened
+        created, _ = self._pick_time(blobs, ("created_time", "created_ts"))
+        if created:
+            return created
+        opened, _ = self._pick_time(blobs, OPEN_FIELDS)
+        if opened and clock.to_utc(opened) <= clock.now_utc():
+            return opened
+        return None
 
     def _first_list(self, markets: List[Dict[str, Any]]) -> bool:
         opened, _ = self._pick_time(list(markets), OPEN_FIELDS)
@@ -193,7 +198,10 @@ class Engine:
                     ev["milestone_title"] = mile.get("title")
                 known = store.get_event(ticker)
                 if known:
-                    self._maybe_apply_milestone(known, ev, cfg)
+                    skipped = (known.get("cancelled_at")
+                               or str(known.get("cancel_source") or "") == "pre_cutoff")
+                    if not skipped:
+                        self._maybe_apply_milestone(known, ev, cfg)
                     store.mark_event(ticker, last_seen_at=clock.now_utc(),
                                      status=ev.get("status") or known.get("status"))
                     continue
@@ -207,6 +215,10 @@ class Engine:
         timer. Never overwrites /when. Never cancels or replaces an order --
         queue position is not spent on a clock update.
         """
+        if known.get("cancelled_at"):
+            return
+        if str(known.get("cancel_source") or "") == "pre_cutoff":
+            return
         if str(known.get("cancel_source") or "").lower().startswith("telegram"):
             return
         mile = clock.parse_iso(ev.get("milestone_start"))
