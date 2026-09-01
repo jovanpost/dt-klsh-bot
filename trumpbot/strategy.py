@@ -15,10 +15,12 @@ Cancel-time resolution, highest wins:
   2. milestones.start_date - buffer_min   <- the automatic clock
   3. min(occurrence, close) - buffer_min, usually the 14-day cap. Nag, but
      still place.
-  4. No timestamp at all -- still nag, still place.
-  5. Never close_time alone as a scheduled start.
+  4. No timestamp at all -- still nag, still place once a clock arrives.
+  5. Never close_time alone as a scheduled start; it moves when the
+     appearance happens, so it is partly an outcome.
 
-MODE AND FAMILY ARE LOCKED TO THE EVENT AT DISCOVERY.
+MODE AND FAMILY ARE LOCKED TO THE EVENT AT DISCOVERY. A series flip takes
+effect on the next event discovered, so one event never mixes DRY and LIVE.
 """
 from __future__ import annotations
 
@@ -56,14 +58,25 @@ def _cutoff_listed_utc():
     except Exception:
         return None
 
-POLL_HOT_SECONDS = 5
-POLL_WARM_SECONDS = 20
-POLL_COLD_SECONDS = 120
+# Event polling cadence. Polling every open event every 5s does not scale past
+# a handful of events; near the cancel it has to be tight, far from it it does
+# not.
+POLL_HOT_SECONDS = 5          # within HOT_WINDOW of cancel
+POLL_WARM_SECONDS = 20        # a placing event, cancel still far off
+POLL_COLD_SECONDS = 120       # LOG events: quotes only
 HOT_WINDOW_MINUTES = 20
+
 KILL_CHECK_SECONDS = 600
 
 
 def taker_fee(count: float, price: float) -> float:
+    """Kalshi taker fee: ceil(0.07 * C * P * (1-P)) to the cent.
+
+    Only charged on orders that crossed at placement. Resting fills pay
+    nothing -- the maker multiplier is 0 unless the series is in the
+    Non-Standard Fees list. Verify that list on the fee-schedule page before
+    going LIVE; it is not only in the PDF.
+    """
     raw = 0.07 * float(count) * float(price) * (1.0 - float(price))
     return math.ceil(raw * 100.0) / 100.0
 
@@ -82,6 +95,19 @@ class Engine:
         self._event_polled: Dict[str, float] = {}
         self._last_tick_log: Dict[str, float] = {}
         self._last_kill_check = 0.0
+        self._last_log_review = 0.0
+
+    def announce(self, mode: Optional[str], message: str) -> None:
+        if config.normalize_mode(mode) == config.MODE_LOG:
+            try:
+                from . import telegram_bot
+                if not telegram_bot.log_notify_on():
+                    return
+            except Exception:
+                return
+        self.notify(message)
+
+    # ------------------------------------------------------------- helpers ---
 
     def _pick_time(self, blobs: List[Dict[str, Any]], fields) -> Tuple[Optional[Any], Optional[str]]:
         best = None
@@ -111,6 +137,7 @@ class Engine:
         return anchor - timedelta(minutes=int(buffer_min)), source, occ, close
 
     def _listed_at(self, markets: List[Dict[str, Any]], ev: Dict[str, Any]):
+        """Earliest Kalshi open/created time we can find for this event."""
         blobs = list(markets) + [ev]
         opened, _ = self._pick_time(blobs, OPEN_FIELDS + ("created_time", "created_ts"))
         return opened
@@ -122,7 +149,15 @@ class Engine:
         age = (clock.now_utc() - clock.to_utc(opened)).total_seconds()
         return 0 <= age <= config.FIRST_LIST_GRACE_SECONDS
 
+    # ----------------------------------------------------------- discovery ---
+
     def due_series(self) -> List[str]:
+        """Series whose discovery sweep is due, stalest first, capped.
+
+        One events call per series per tick is 4 requests/second at ~180
+        series before any market polling. LOG series sweep every 15 minutes;
+        DRY and LIVE every 45 seconds; OFF never.
+        """
         now = _time.time()
         due: List[Tuple[float, str]] = []
         for s, cfg in config.series_config().items():
@@ -170,6 +205,10 @@ class Engine:
 
     def _maybe_apply_milestone(self, known: Dict[str, Any], ev: Dict[str, Any],
                                cfg: Dict[str, Any]) -> None:
+        """A milestone that appears or moves after first list retightens the
+        timer. Never overwrites /when. Never cancels or replaces an order --
+        queue position is not spent on a clock update.
+        """
         if str(known.get("cancel_source") or "").lower().startswith("telegram"):
             return
         mile = clock.parse_iso(ev.get("milestone_start"))
@@ -186,7 +225,7 @@ class Engine:
                                f"cancel {clock.fmt_ct(new_cancel)}")
         page = kalshi.event_page_url(known.get("series") or "",
                                      known.get("title") or ev.get("title"), ticker)
-        self.notify(
+        self.announce(known.get("mode"),
             f"TIME UPDATED ({known.get('series')}) [{known.get('mode')}]\n{ticker}\n"
             f"{page}\n"
             f"Event time: {clock.fmt_ct(mile)} (milestone)\n"
@@ -255,9 +294,11 @@ class Engine:
                                f"{len(markets)} markets, cancel "
                                f"{clock.fmt_ct(cancel_at)} ({source})")
 
+        # LOG series are recorded, never traded. No price means no order is
+        # possible regardless of mode -- Hearing and the Sports splits sit here.
         placing = mode in config.PLACING_MODES and config.tradeable(cfg)
 
-        self.notify(
+        self.announce(mode,
             f"NEW EVENT ({series}) [{mode}/{family}]\n{ev.get('title') or ticker}\n"
             f"{ticker}\n{page}\n"
             f"Event time: {clock.fmt_ct(occ)} ({source or 'unknown'})"
@@ -284,10 +325,12 @@ class Engine:
         if cancel_at is not None and cancel_at <= now:
             store.mark_event(ticker, cancelled_at=now, notified_cancel=True)
             store.log_line("warn", f"{ticker}: cancel time already past at discovery")
-            self.notify(f"{ticker}: appeared inside the cancel buffer. Not traded.")
+            self.announce(mode, f"{ticker}: appeared inside the cancel buffer. Not traded.")
             return
 
         self.place_missing(cfg, ticker, markets, mode)
+
+    # ----------------------------------------------------------- placement ---
 
     def place_missing(self, cfg: Dict[str, Any], event_ticker: str,
                       markets: List[Dict[str, Any]], mode: str) -> int:
@@ -322,7 +365,7 @@ class Engine:
                             if resp.get("remaining_count") is not None else None
                         fill_f = float(resp.get("fill_count") or 0)
                     except (TypeError, ValueError):
-                        rem_f, fill_f = 0.0, 0.0
+                        rem_f, fill_f = None, 0.0
                     if rem_f is not None and rem_f <= 0 and fill_f > 0:
                         filled_now, status, fill_price = True, "filled", price
                 except Exception as exc:
@@ -346,8 +389,7 @@ class Engine:
                 placed += 1
             elif filled_now:
                 placed += 1
-                word = m.get("yes_sub_title") or m.get("subtitle") or ticker
-                self.notify(f"LIVE FILL ({series}) {word}\n{ticker} NO {price:.2f} (at place)")
+                self.notify(f"LIVE FILL ({series}) {ticker} NO {price:.2f} (at place)")
 
         if placed:
             ev = store.get_event(event_ticker) or {}
@@ -358,7 +400,10 @@ class Engine:
                                    f"NO @ {price:.2f} x {count:g}")
         return placed
 
+    # --------------------------------------------------------------- nag ---
+
     def maybe_nag(self, ev: Dict[str, Any]) -> None:
+        """Tell Jovan the clock is a fallback. Nag, never hold."""
         if is_trusted(ev.get("cancel_source")):
             return
         if config.normalize_mode(ev.get("mode")) not in config.PLACING_MODES:
@@ -377,6 +422,8 @@ class Engine:
             f"Orders resting: {len(store.resting_orders(ticker))}\n"
             f"Check the app clock, then:\n/when {ticker} 8:00 PM central")
 
+    # ------------------------------------------------------------- polling ---
+
     def _poll_interval(self, ev: Dict[str, Any]) -> int:
         mode = config.normalize_mode(ev.get("mode"))
         if mode not in config.PLACING_MODES:
@@ -393,6 +440,7 @@ class Engine:
         cfg = config.series_cfg(series)
         if not cfg:
             return
+        # The event's own locked mode, not the series' current mode.
         mode = config.normalize_mode(ev.get("mode") or cfg["mode"])
         ticker = ev["event_ticker"]
         now = clock.now_utc()
@@ -440,6 +488,8 @@ class Engine:
             self.check_fills(ev, markets, mode)
         self.sample_ticks(ev, markets)
 
+    # ------------------------------------------------------------- fills ---
+
     def check_fills(self, ev: Dict[str, Any], markets: List[Dict[str, Any]],
                     mode: str) -> None:
         if mode == config.MODE_LIVE:
@@ -448,6 +498,12 @@ class Engine:
             self.check_paper_fills(ev, markets)
 
     def check_paper_fills(self, ev: Dict[str, Any], markets: List[Dict[str, Any]]) -> None:
+        """DRY fills come from watching the book, not the fill API.
+
+        Our resting NO limit at p fills when someone will sell NO at p or
+        lower -- equivalently when the YES bid reaches (1 - p). Our fill price
+        is our own limit, because we are the resting side.
+        """
         by_ticker = {m.get("ticker"): m for m in markets}
         for row in store.resting_orders(ev["event_ticker"], mode=config.MODE_DRY):
             m = by_ticker.get(row["market_ticker"])
@@ -463,8 +519,8 @@ class Engine:
                 store.log_line("fill", f"[{ev['series']}/DRY] PAPER FILL "
                                        f"{row['market_ticker']} NO {limit:.2f} "
                                        f"x {float(row['count']):g} (book {ask:.2f})")
-                word = row.get("market_title") or row["market_ticker"]
-                self.notify(f"FILL ({ev['series']}) [DRY] {word}\n"
+                self.notify(f"FILL ({ev['series']}) [DRY] "
+                            f"{row.get('market_title') or ''}\n"
                             f"{row['market_ticker']}\n"
                             f"NO {limit:.2f} x {float(row['count']):g}\n"
                             f"Book was offering NO at {ask:.2f}")
@@ -487,11 +543,18 @@ class Engine:
                                fill_price=price)
             store.log_line("fill", f"[{ev['series']}/LIVE] FILL {row['market_ticker']} "
                                    f"NO {price:.2f}")
-            word = row.get("market_title") or row["market_ticker"]
-            self.notify(f"LIVE FILL ({ev['series']}) {word}\n"
+            self.notify(f"LIVE FILL ({ev['series']}) "
+                        f"{row.get('market_title') or ''}\n"
                         f"{row['market_ticker']} NO {price:.2f}")
 
+    # ------------------------------------------------------------- cancel ---
+
     def cancel_event(self, ev: Dict[str, Any], reason: str = "") -> None:
+        """Guarded: if cancelled_at is set we do nothing.
+
+        The WNT bot re-cancelled every five minutes from 5:29 to 6:15 and
+        spammed Telegram, because dry-run cancel never wrote cancelled_at.
+        """
         ticker = ev["event_ticker"]
         fresh = store.get_event(ticker) or ev
         if fresh.get("cancelled_at"):
@@ -520,17 +583,19 @@ class Engine:
                                f"{n} pulled ({reason})")
 
         if mode not in config.PLACING_MODES and not rows:
-            self.notify(f"EVENT CLOSED ({ev.get('series')}) [{mode}]\n{ticker}\n"
+            self.announce(mode, f"EVENT CLOSED ({ev.get('series')}) [{mode}]\n{ticker}\n"
                         f"Reason: {reason}\nRecorded only, no orders.")
             return
 
-        self.notify(
+        self.announce(mode,
             f"CANCELLED ({ev.get('series')}) [{mode}]\n{ticker}\n"
             f"Reason: {reason}\n"
             f"Clock was: {fresh.get('cancel_source') or 'none'}\n"
             f"Orders pulled: {n}\n"
             f"Filled: {st['fills']} of {st['orders']} ({clock.pct(st['fill_rate'])})"
             + (f"\nLive cancel errors: {live_errors}" if live_errors else ""))
+
+    # -------------------------------------------------------------- ticks ---
 
     def sample_ticks(self, ev: Dict[str, Any], markets: List[Dict[str, Any]]) -> None:
         mode = config.normalize_mode(ev.get("mode"))
@@ -554,7 +619,15 @@ class Engine:
             except Exception:
                 pass
 
+    # --------------------------------------------------------- kill switch ---
+
     def kill_switch(self) -> None:
+        """Warn at 20 settled fills below breakeven, revert LIVE to LOG at 50.
+
+        The edge will not last forever and the bot should notice before Jovan
+        does. Twenty fills cannot separate a dead edge from ordinary variance
+        at these base rates, so twenty only warns.
+        """
         families = {c["family"] for c in config.series_config().values()}
         for fam in sorted(families):
             for mode in (config.MODE_LIVE, config.MODE_DRY):
@@ -588,6 +661,8 @@ class Engine:
                     self.notify(f"KILL SWITCH (DRY, no action)\n{body}\n"
                                 f"Nothing reverted -- this family is not live.")
 
+    # --------------------------------------------------------------- tick ---
+
     def run_once(self, allow_place: bool = True) -> None:
         if allow_place:
             self.discover()
@@ -612,8 +687,34 @@ class Engine:
                 self.kill_switch()
             except Exception as exc:
                 log.warning("Kill switch check failed: %s", exc)
+        if now_s - self._last_log_review >= config.LOG_REVIEW_SECONDS:
+            self._last_log_review = now_s
+            try:
+                self.log_review_nag()
+            except Exception as exc:
+                log.warning("LOG review check failed: %s", exc)
+
+    def log_review_nag(self) -> None:
+        for d in analytics.log_reviews_due():
+            key = f"log_review_ping:{d['family']}:{d['reason']}:{d['events']}"
+            if store.get_state(key):
+                continue
+            store.set_state(key, clock.now_utc().isoformat())
+            self.notify(
+                f"RESEARCH REVIEW ({d['family']}) [LOG]\n"
+                f"{d['events']} events logged, +{d['added']} since last review "
+                f"({d['reason']}).\n"
+                f"Re-run the candle backtest in the research chat before "
+                f"any /mode DRY.\n"
+                f"/logstatus for the table. /logreviewed {d['family']} "
+                f"after you look."
+            )
 
     def poll_event_paused(self, ev: Dict[str, Any]) -> None:
+        """While paused: still honour cancel time and watch fills. No new orders.
+
+        Pausing must never orphan a resting order through its cancel time.
+        """
         mode = config.normalize_mode(ev.get("mode"))
         cancel_at = ev.get("cancel_at")
         if cancel_at and clock.to_utc(cancel_at) <= clock.now_utc():
