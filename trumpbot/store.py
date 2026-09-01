@@ -5,9 +5,9 @@ kwargs that the SQLAlchemy Table did not define, so every insert raised
 "Unconsumed column names" and the bot missed the open by 12 minutes.
 
 Three things must always agree:
-  1. schema.sql / alter.sql  (what Postgres actually has)
+  1. schema.sql / alter.sql / alter2.sql   (what Postgres actually has)
   2. the Table() objects below
-  3. ORDER_FIELDS / EVENT_FIELDS, which is what record_* is allowed to write
+  3. ORDER_FIELDS / EVENT_FIELDS / SERIES_FIELDS, the write lists
 
 assert_schema() checks all three at boot and refuses to start on a mismatch.
 Add a field? Add it in all three places in the same change, and run the ALTER
@@ -17,11 +17,11 @@ from __future__ import annotations
 
 import logging
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy import (Boolean, Column, DateTime, Integer, MetaData, Numeric,
-                        String, Table, Text, and_, create_engine, inspect,
+                        Table, Text, and_, create_engine, desc, inspect,
                         select, text, update)
 from sqlalchemy.engine import Engine
 
@@ -32,11 +32,26 @@ log = logging.getLogger("trumpbot.store")
 P = config.TABLE_PREFIX
 metadata = MetaData()
 
+series_tbl = Table(
+    f"{P}series", metadata,
+    Column("series", Text, primary_key=True),
+    Column("family", Text, nullable=False, default="OTHER"),
+    Column("mode", Text, nullable=False, default="LOG"),
+    Column("rest_price", Numeric),
+    Column("dollars", Numeric),
+    Column("buffer_min", Integer, default=5),
+    Column("enabled", Boolean, default=True),
+    Column("notes", Text),
+    Column("added_at", DateTime(timezone=True)),
+    Column("updated_at", DateTime(timezone=True)),
+)
+
 events = Table(
     f"{P}events", metadata,
     Column("event_ticker", Text, primary_key=True),
     Column("series", Text, nullable=False),
-    Column("mode", Text),                 # locked at discovery, never rewritten
+    Column("family", Text),
+    Column("mode", Text),
     Column("title", Text),
     Column("subtitle", Text),
     Column("discovered_at", DateTime(timezone=True)),
@@ -60,7 +75,8 @@ orders = Table(
     f"{P}orders", metadata,
     Column("id", Integer, primary_key=True, autoincrement=True),
     Column("series", Text, nullable=False),
-    Column("mode", Text),                 # the mode this row was created under
+    Column("family", Text),
+    Column("mode", Text),
     Column("event_ticker", Text, nullable=False),
     Column("market_ticker", Text, nullable=False),
     Column("market_title", Text),
@@ -68,7 +84,7 @@ orders = Table(
     Column("limit_price", Numeric),
     Column("count", Numeric),
     Column("dollars", Numeric),
-    Column("dry_run", Boolean, default=True),   # kept for history; mode wins
+    Column("dry_run", Boolean, default=True),
     Column("took_at_open", Boolean, default=False),
     Column("quote_at_place", Numeric),
     Column("placed_at", DateTime(timezone=True)),
@@ -113,15 +129,13 @@ applog = Table(
     Column("message", Text),
 )
 
-# The single source of truth for what record_* may write.
 EVENT_FIELDS = [c.name for c in events.columns]
 ORDER_FIELDS = [c.name for c in orders.columns if c.name != "id"]
+SERIES_FIELDS = [c.name for c in series_tbl.columns]
 
 _engine: Optional[Engine] = None
 _engine_lock = threading.Lock()
 
-
-# ------------------------------------------------------------------ engine ---
 
 def _candidate_urls() -> List[str]:
     url = config.get("DATABASE_URL")
@@ -131,8 +145,6 @@ def _candidate_urls() -> List[str]:
     if url.startswith("postgres://"):
         url = url.replace("postgres://", "postgresql://", 1)
     urls = [url]
-    # Documented fallback: transaction pooler 6543 refuses connections during
-    # Supabase incidents; session pooler 5432 usually still answers.
     if ":6543" in url:
         urls.append(url.replace(":6543", ":5432"))
     elif ":5432" in url:
@@ -156,7 +168,8 @@ def get_engine() -> Engine:
                 with eng.connect() as conn:
                     conn.execute(text("select 1"))
                 _engine = eng
-                log.info("Database connected on port %s", url.split(":")[-1].split("/")[0])
+                log.info("Database connected on port %s",
+                         url.split(":")[-1].split("/")[0])
                 return _engine
             except Exception as exc:
                 last = exc
@@ -166,19 +179,26 @@ def get_engine() -> Engine:
 
 def init() -> None:
     eng = get_engine()
-    metadata.create_all(eng)   # creates missing TABLES only, never columns
+    metadata.create_all(eng)
     assert_schema()
+    try:
+        added = config.seed_series()
+        if added:
+            log_line("info", f"Seeded {added} series rows")
+    except Exception as exc:
+        log.warning("Series seed failed: %s", exc)
 
 
 def assert_schema() -> None:
-    """Fail loudly at boot instead of quietly at the open."""
     eng = get_engine()
     insp = inspect(eng)
     problems: List[str] = []
-    for table, fields in ((events, EVENT_FIELDS), (orders, ORDER_FIELDS),
-                          (ticks, [c.name for c in ticks.columns]),
-                          (state, [c.name for c in state.columns]),
-                          (applog, [c.name for c in applog.columns])):
+    checks = ((events, EVENT_FIELDS), (orders, ORDER_FIELDS),
+              (series_tbl, SERIES_FIELDS),
+              (ticks, [c.name for c in ticks.columns]),
+              (state, [c.name for c in state.columns]),
+              (applog, [c.name for c in applog.columns]))
+    for table, fields in checks:
         if not insp.has_table(table.name):
             problems.append(f"table {table.name} does not exist")
             continue
@@ -188,18 +208,16 @@ def assert_schema() -> None:
         if missing_in_db:
             problems.append(
                 f"{table.name}: Postgres is missing {sorted(missing_in_db)} "
-                f"-- run alter.sql before starting")
+                f"-- run alter2.sql before starting")
         missing_in_model = set(fields) - model_cols
         if missing_in_model:
-            problems.append(f"{table.name}: write list has {sorted(missing_in_model)} "
-                            f"not defined on the Table")
+            problems.append(f"{table.name}: write list has "
+                            f"{sorted(missing_in_model)} not on the Table")
     if problems:
         raise RuntimeError("Schema mismatch:\n  " + "\n  ".join(problems))
 
 
 def _filtered(row: Dict[str, Any], allowed: List[str]) -> Dict[str, Any]:
-    """Drop anything not in the allowed list, so a stray key cannot crash an
-    insert with 'Unconsumed column names'."""
     extra = set(row) - set(allowed)
     if extra:
         log.warning("Dropping unknown fields %s", sorted(extra))
@@ -209,11 +227,54 @@ def _filtered(row: Dict[str, Any], allowed: List[str]) -> Dict[str, Any]:
 def _pg_insert(table):
     from sqlalchemy.dialects.postgresql import insert as pg
     from sqlalchemy.dialects.sqlite import insert as lite
-    name = get_engine().dialect.name
-    return lite(table) if name == "sqlite" else pg(table)
+    return lite(table) if get_engine().dialect.name == "sqlite" else pg(table)
 
 
-# ------------------------------------------------------------------ events ---
+def all_series() -> List[Dict[str, Any]]:
+    with get_engine().connect() as conn:
+        rows = conn.execute(
+            select(series_tbl).order_by(series_tbl.c.series)).mappings().all()
+    return [dict(r) for r in rows]
+
+
+def get_series(series: str) -> Optional[Dict[str, Any]]:
+    with get_engine().connect() as conn:
+        r = conn.execute(select(series_tbl)
+                         .where(series_tbl.c.series == series)).mappings().first()
+    return dict(r) if r else None
+
+
+def upsert_series(row: Dict[str, Any]) -> None:
+    row = dict(row)
+    row.setdefault("added_at", clock.now_utc())
+    row["updated_at"] = clock.now_utc()
+    row = _filtered(row, SERIES_FIELDS)
+    stmt = _pg_insert(series_tbl).values(**row)
+    updates = {k: stmt.excluded[k] for k in row if k != "series"}
+    stmt = stmt.on_conflict_do_update(index_elements=["series"], set_=updates)
+    with get_engine().begin() as conn:
+        conn.execute(stmt)
+    config.invalidate()
+
+
+def set_series_mode(series: str, mode: str) -> None:
+    with get_engine().begin() as conn:
+        conn.execute(update(series_tbl).where(series_tbl.c.series == series)
+                     .values(mode=mode, updated_at=clock.now_utc()))
+    config.invalidate()
+    log_line("info", f"{series} mode set to {mode}")
+
+
+def set_family_mode(family: str, mode: str) -> int:
+    with get_engine().begin() as conn:
+        res = conn.execute(update(series_tbl)
+                           .where(series_tbl.c.family == family)
+                           .values(mode=mode, updated_at=clock.now_utc()))
+    config.invalidate()
+    n = res.rowcount or 0
+    log_line("info", f"{family}: {n} series set to {mode}")
+    return n
+
 
 def upsert_event(row: Dict[str, Any]) -> None:
     row = _filtered(row, EVENT_FIELDS)
@@ -226,25 +287,24 @@ def upsert_event(row: Dict[str, Any]) -> None:
 
 def get_event(event_ticker: str) -> Optional[Dict[str, Any]]:
     with get_engine().connect() as conn:
-        r = conn.execute(select(events).where(events.c.event_ticker == event_ticker)).mappings().first()
+        r = conn.execute(select(events)
+                         .where(events.c.event_ticker == event_ticker)).mappings().first()
     return dict(r) if r else None
 
 
 def live_events() -> List[Dict[str, Any]]:
-    """Events we still act on: not cancelled yet."""
     with get_engine().connect() as conn:
         rows = conn.execute(
             select(events).where(events.c.cancelled_at.is_(None))
-            .order_by(events.c.cancel_at.asc().nulls_last())
-        ).mappings().all()
+            .order_by(events.c.cancel_at.asc().nulls_last())).mappings().all()
     return [dict(r) for r in rows]
 
 
 def all_events(limit: int = 400) -> List[Dict[str, Any]]:
     with get_engine().connect() as conn:
-        rows = conn.execute(
-            select(events).order_by(events.c.discovered_at.desc()).limit(limit)
-        ).mappings().all()
+        rows = conn.execute(select(events)
+                            .order_by(desc(events.c.discovered_at))
+                            .limit(limit)).mappings().all()
     return [dict(r) for r in rows]
 
 
@@ -253,10 +313,9 @@ def mark_event(event_ticker: str, **fields) -> None:
     if not fields:
         return
     with get_engine().begin() as conn:
-        conn.execute(update(events).where(events.c.event_ticker == event_ticker).values(**fields))
+        conn.execute(update(events)
+                     .where(events.c.event_ticker == event_ticker).values(**fields))
 
-
-# ------------------------------------------------------------------ orders ---
 
 def record_order(row: Dict[str, Any]) -> None:
     row = _filtered(row, ORDER_FIELDS)
@@ -265,17 +324,11 @@ def record_order(row: Dict[str, Any]) -> None:
 
 
 def existing_market_tickers(event_ticker: str, mode: str) -> set:
-    """Markets in this event we already have a row for, under this mode.
-
-    Keyed on mode, not dry_run: a DRY row and a LIVE row for the same market
-    are different rows and must not shadow each other.
-    """
     with get_engine().connect() as conn:
         rows = conn.execute(
             select(orders.c.market_ticker).where(
                 and_(orders.c.event_ticker == event_ticker,
-                     orders.c.mode == mode))
-        ).all()
+                     orders.c.mode == mode))).all()
     return {r[0] for r in rows}
 
 
@@ -309,28 +362,31 @@ def cancel_resting_for_event(event_ticker: str, when: datetime) -> int:
 
 
 def unsettled_orders() -> List[Dict[str, Any]]:
-    """Everything without a result yet -- includes DRY AND unfilled rows.
-
-    settle.py on the WNT bot skipped dry-run rows and the dashboard sat at
-    $0.00 forever. Do not add a mode filter here.
-    """
     with get_engine().connect() as conn:
         rows = conn.execute(
             select(orders).where(and_(orders.c.result.is_(None),
-                                      orders.c.status != "rejected"))
-        ).mappings().all()
+                                      orders.c.status != "rejected"))).mappings().all()
     return [dict(r) for r in rows]
 
 
 def orders_for_dashboard(limit: int = 2000) -> List[Dict[str, Any]]:
     with get_engine().connect() as conn:
-        rows = conn.execute(
-            select(orders).order_by(orders.c.placed_at.desc()).limit(limit)
-        ).mappings().all()
+        rows = conn.execute(select(orders)
+                            .order_by(desc(orders.c.placed_at))
+                            .limit(limit)).mappings().all()
     return [dict(r) for r in rows]
 
 
-# ------------------------------------------------------- ticks / state / log ---
+def recent_family_fills(family: str, mode: str, limit: int = 200) -> List[Dict[str, Any]]:
+    with get_engine().connect() as conn:
+        rows = conn.execute(
+            select(orders).where(and_(orders.c.family == family,
+                                      orders.c.mode == mode,
+                                      orders.c.status == "filled",
+                                      orders.c.result.isnot(None)))
+            .order_by(desc(orders.c.settled_at)).limit(limit)).mappings().all()
+    return [dict(r) for r in rows]
+
 
 def record_tick(row: Dict[str, Any]) -> None:
     row = _filtered(row, [c.name for c in ticks.columns])
@@ -338,8 +394,16 @@ def record_tick(row: Dict[str, Any]) -> None:
         conn.execute(ticks.insert().values(**row))
 
 
+def prune_ticks(days: int = 14) -> int:
+    cutoff = clock.now_utc() - timedelta(days=days)
+    with get_engine().begin() as conn:
+        res = conn.execute(ticks.delete().where(ticks.c.ts < cutoff))
+    return res.rowcount or 0
+
+
 def set_state(key: str, value: str) -> None:
-    stmt = _pg_insert(state).values(key=key, value=str(value), updated_at=clock.now_utc())
+    stmt = _pg_insert(state).values(key=key, value=str(value),
+                                    updated_at=clock.now_utc())
     stmt = stmt.on_conflict_do_update(
         index_elements=["key"],
         set_={"value": stmt.excluded.value, "updated_at": stmt.excluded.updated_at})
@@ -358,18 +422,6 @@ def delete_state(key: str) -> None:
         conn.execute(state.delete().where(state.c.key == key))
 
 
-# -------------------------------------------------------------- series mode ---
-
-def get_series_mode(series: str) -> Optional[str]:
-    """DB override set by Telegram /mode. None means fall back to config."""
-    return get_state(f"mode:{series}")
-
-
-def set_series_mode(series: str, mode: str) -> None:
-    set_state(f"mode:{series}", mode)
-    log_line("info", f"{series} mode set to {mode}")
-
-
 def log_line(level: str, message: str) -> None:
     try:
         with get_engine().begin() as conn:
@@ -381,6 +433,6 @@ def log_line(level: str, message: str) -> None:
 
 def recent_log(limit: int = 60) -> List[Dict[str, Any]]:
     with get_engine().connect() as conn:
-        rows = conn.execute(
-            select(applog).order_by(applog.c.id.desc()).limit(limit)).mappings().all()
+        rows = conn.execute(select(applog)
+                            .order_by(desc(applog.c.id)).limit(limit)).mappings().all()
     return [dict(r) for r in rows]
