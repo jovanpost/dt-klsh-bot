@@ -74,6 +74,24 @@ def no_ask(market: Dict[str, Any]) -> Optional[float]:
     return None
 
 
+def fp_count(value: Any) -> Optional[float]:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def yes_bid_size(market: Dict[str, Any]) -> Optional[float]:
+    """Contracts at the best YES bid — that size is what fills a resting NO."""
+    for key in ("yes_bid_size_fp", "yes_bid_size", "no_ask_size_fp", "no_ask_size"):
+        v = fp_count(market.get(key))
+        if v is not None:
+            return v
+    return None
+
+
 def last_price(market: Dict[str, Any]) -> Optional[float]:
     return to_dollars(market.get("last_price_dollars") or market.get("last_price"))
 
