@@ -24,7 +24,6 @@ from sqlalchemy import (Boolean, Column, DateTime, Integer, MetaData, Numeric,
                         Table, Text, and_, create_engine, desc, inspect,
                         select, text, update)
 from sqlalchemy.engine import Engine
-from sqlalchemy.pool import NullPool
 
 from . import clock, config
 
@@ -52,7 +51,7 @@ events = Table(
     Column("event_ticker", Text, primary_key=True),
     Column("series", Text, nullable=False),
     Column("family", Text),
-    Column("mode", Text),
+    Column("mode", Text),                 # locked at discovery, never rewritten
     Column("title", Text),
     Column("subtitle", Text),
     Column("discovered_at", DateTime(timezone=True)),
@@ -77,14 +76,16 @@ orders = Table(
     Column("id", Integer, primary_key=True, autoincrement=True),
     Column("series", Text, nullable=False),
     Column("family", Text),
-    Column("mode", Text),
+    Column("mode", Text),                 # the mode this row was created under
     Column("event_ticker", Text, nullable=False),
     Column("market_ticker", Text, nullable=False),
     Column("market_title", Text),
     Column("side", Text, default="no"),
     Column("limit_price", Numeric),
     Column("count", Numeric),
-    Column("dollars", Numeric),
+    Column("filled_count", Numeric),      # accumulated contracts; leftover stays resting
+    Column("dollars", Numeric),           # stake; families differ, so P/L is
+                                          # compared per $1 staked, not raw
     Column("dry_run", Boolean, default=True),
     Column("took_at_open", Boolean, default=False),
     Column("quote_at_place", Numeric),
@@ -138,6 +139,8 @@ _engine: Optional[Engine] = None
 _engine_lock = threading.Lock()
 
 
+# ------------------------------------------------------------------ engine ---
+
 def _candidate_urls() -> List[str]:
     url = config.get("DATABASE_URL")
     if not url:
@@ -163,12 +166,8 @@ def get_engine() -> Engine:
             try:
                 kwargs: Dict[str, Any] = {"pool_pre_ping": True}
                 if url.startswith("postgresql"):
-                    # Streamlit reruns + worker + Telegram cannot share a
-                    # tiny QueuePool. NullPool opens and closes per call.
-                    kwargs.update(
-                        poolclass=NullPool,
-                        connect_args={"connect_timeout": 10},
-                    )
+                    kwargs.update(pool_size=3, max_overflow=2, pool_recycle=300,
+                                  connect_args={"connect_timeout": 10})
                 eng = create_engine(url, **kwargs)
                 with eng.connect() as conn:
                     conn.execute(text("select 1"))
@@ -184,7 +183,7 @@ def get_engine() -> Engine:
 
 def init() -> None:
     eng = get_engine()
-    metadata.create_all(eng)
+    metadata.create_all(eng)   # creates missing TABLES only, never columns
     assert_schema()
     try:
         added = config.seed_series()
@@ -235,6 +234,8 @@ def _pg_insert(table):
     return lite(table) if get_engine().dialect.name == "sqlite" else pg(table)
 
 
+# ------------------------------------------------------------------ series ---
+
 def all_series() -> List[Dict[str, Any]]:
     with get_engine().connect() as conn:
         rows = conn.execute(
@@ -281,6 +282,8 @@ def set_family_mode(family: str, mode: str) -> int:
     return n
 
 
+# ------------------------------------------------------------------ events ---
+
 def upsert_event(row: Dict[str, Any]) -> None:
     row = _filtered(row, EVENT_FIELDS)
     stmt = _pg_insert(events).values(**row)
@@ -321,6 +324,8 @@ def mark_event(event_ticker: str, **fields) -> None:
         conn.execute(update(events)
                      .where(events.c.event_ticker == event_ticker).values(**fields))
 
+
+# ------------------------------------------------------------------ orders ---
 
 def record_order(row: Dict[str, Any]) -> None:
     row = _filtered(row, ORDER_FIELDS)
@@ -367,6 +372,7 @@ def cancel_resting_for_event(event_ticker: str, when: datetime) -> int:
 
 
 def unsettled_orders() -> List[Dict[str, Any]]:
+    """Includes DRY and unfilled rows. Do not add a mode filter here."""
     with get_engine().connect() as conn:
         rows = conn.execute(
             select(orders).where(and_(orders.c.result.is_(None),
@@ -383,6 +389,7 @@ def orders_for_dashboard(limit: int = 2000) -> List[Dict[str, Any]]:
 
 
 def recent_family_fills(family: str, mode: str, limit: int = 200) -> List[Dict[str, Any]]:
+    """Settled fills for a family, newest first. Feeds the kill switch."""
     with get_engine().connect() as conn:
         rows = conn.execute(
             select(orders).where(and_(orders.c.family == family,
@@ -393,6 +400,8 @@ def recent_family_fills(family: str, mode: str, limit: int = 200) -> List[Dict[s
     return [dict(r) for r in rows]
 
 
+# ------------------------------------------------------- ticks / state / log ---
+
 def record_tick(row: Dict[str, Any]) -> None:
     row = _filtered(row, [c.name for c in ticks.columns])
     with get_engine().begin() as conn:
@@ -400,6 +409,7 @@ def record_tick(row: Dict[str, Any]) -> None:
 
 
 def prune_ticks(days: int = 14) -> int:
+    """Quotes are operational, not an archive. Candles never live here."""
     cutoff = clock.now_utc() - timedelta(days=days)
     with get_engine().begin() as conn:
         res = conn.execute(ticks.delete().where(ticks.c.ts < cutoff))
