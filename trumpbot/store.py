@@ -24,6 +24,7 @@ from sqlalchemy import (Boolean, Column, DateTime, Integer, MetaData, Numeric,
                         Table, Text, and_, create_engine, desc, inspect,
                         select, text, update)
 from sqlalchemy.engine import Engine
+from sqlalchemy.pool import NullPool
 
 from . import clock, config
 
@@ -162,8 +163,12 @@ def get_engine() -> Engine:
             try:
                 kwargs: Dict[str, Any] = {"pool_pre_ping": True}
                 if url.startswith("postgresql"):
-                    kwargs.update(pool_size=3, max_overflow=2, pool_recycle=300,
-                                  connect_args={"connect_timeout": 10})
+                    # Streamlit reruns + worker + Telegram cannot share a
+                    # tiny QueuePool. NullPool opens and closes per call.
+                    kwargs.update(
+                        poolclass=NullPool,
+                        connect_args={"connect_timeout": 10},
+                    )
                 eng = create_engine(url, **kwargs)
                 with eng.connect() as conn:
                     conn.execute(text("select 1"))
