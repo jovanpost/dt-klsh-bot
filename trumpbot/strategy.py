@@ -413,18 +413,14 @@ class Engine:
     # --------------------------------------------------------------- nag ---
 
     def maybe_nag(self, ev: Dict[str, Any]) -> None:
-        """Fallback clock: once at +90m, then once per 24h. Never hold orders."""
+        """Tell Jovan the clock is a fallback. Nag, never hold."""
         if is_trusted(ev.get("cancel_source")):
             return
         if config.normalize_mode(ev.get("mode")) not in config.PLACING_MODES:
             return
         now = clock.now_utc()
         last = clock.to_utc(ev.get("nagged_at")) if ev.get("nagged_at") else None
-        disc = clock.to_utc(ev.get("discovered_at")) if ev.get("discovered_at") else now
-        if last is None:
-            if (now - disc).total_seconds() < 90 * 60:
-                return
-        elif (now - last).total_seconds() < 24 * 3600:
+        if last and (now - last).total_seconds() < config.NAG_REPEAT_MINUTES * 60:
             return
         ticker = ev["event_ticker"]
         store.mark_event(ticker, nagged_at=now)
@@ -435,6 +431,7 @@ class Engine:
             f"({ev.get('cancel_source') or 'none'})\n"
             f"Orders resting: {len(store.resting_orders(ticker))}\n"
             f"Check the app clock, then:\n/when {ticker} 8:00 PM central")
+
     # ------------------------------------------------------------- polling ---
 
     def _poll_interval(self, ev: Dict[str, Any]) -> int:
@@ -511,12 +508,7 @@ class Engine:
             self.check_paper_fills(ev, markets)
 
     def check_paper_fills(self, ev: Dict[str, Any], markets: List[Dict[str, Any]]) -> None:
-        """DRY fills come from watching the book, not the fill API.
-
-        Our resting NO limit at p fills when someone will sell NO at p or
-        lower -- equivalently when the YES bid reaches (1 - p). Our fill price
-        is our own limit, because we are the resting side.
-        """
+        """DRY: keep working the leftover. Price the slice off the book."""
         by_ticker = {m.get("ticker"): m for m in markets}
         for row in store.resting_orders(ev["event_ticker"], mode=config.MODE_DRY):
             m = by_ticker.get(row["market_ticker"])
@@ -526,17 +518,43 @@ class Engine:
             if ask is None:
                 continue
             limit = float(row["limit_price"])
-            if ask <= limit:
-                store.update_order(row["id"], status="filled",
-                                   filled_at=clock.now_utc(), fill_price=limit)
-                store.log_line("fill", f"[{ev['series']}/DRY] PAPER FILL "
-                                       f"{row['market_ticker']} NO {limit:.2f} "
-                                       f"x {float(row['count']):g} (book {ask:.2f})")
-                self.notify(f"FILL ({ev['series']}) [DRY] "
-                            f"{row.get('market_title') or ''}\n"
-                            f"{row['market_ticker']}\n"
-                            f"NO {limit:.2f} x {float(row['count']):g}\n"
-                            f"Book was offering NO at {ask:.2f}")
+            if ask > limit:
+                continue
+            wanted = float(row["count"] or 0)
+            already = float(row.get("filled_count") or 0)
+            remaining = wanted - already
+            if remaining <= 1e-9:
+                continue
+            available = kalshi.yes_bid_size(m)
+            slice_n = remaining if available is None else min(remaining, max(0.0, available))
+            if slice_n <= 1e-9:
+                continue
+            px = min(limit, max(0.01, ask))
+            total = already + slice_n
+            prev_px = float(row["fill_price"] or limit)
+            vwap = ((already * prev_px) + (slice_n * px)) / total
+            done = total + 1e-9 >= wanted
+            store.update_order(
+                row["id"],
+                filled_count=total,
+                fill_price=vwap,
+                filled_at=row.get("filled_at") or clock.now_utc(),
+                status="filled" if done else "resting",
+            )
+            store.log_line(
+                "fill",
+                f"[{ev['series']}/DRY] PAPER SLICE {row['market_ticker']} "
+                f"NO {px:.2f} x {slice_n:g} (book {ask:.2f}) "
+                f"now {total:g}/{wanted:g}"
+            )
+            self.notify(
+                f"FILL ({ev['series']}) [DRY] "
+                f"{row.get('market_title') or ''}\n"
+                f"{row['market_ticker']}\n"
+                f"NO {px:.2f} x {slice_n:g}  ({total:g}/{wanted:g})\n"
+                f"Book was offering NO at {ask:.2f}"
+                + ("" if not done else "\nComplete.")
+            )
 
     def check_live_fills(self, ev: Dict[str, Any]) -> None:
         for row in store.resting_orders(ev["event_ticker"], mode=config.MODE_LIVE):
@@ -548,17 +566,49 @@ class Engine:
                 continue
             if not fills:
                 continue
-            f = fills[0]
-            price = kalshi.to_dollars(f.get("no_price_dollars") or f.get("no_price")) \
-                or float(row["limit_price"])
-            store.update_order(row["id"], status="filled",
-                               filled_at=clock.parse_iso(f.get("created_time")) or clock.now_utc(),
-                               fill_price=price)
-            store.log_line("fill", f"[{ev['series']}/LIVE] FILL {row['market_ticker']} "
-                                   f"NO {price:.2f}")
-            self.notify(f"LIVE FILL ({ev['series']}) "
-                        f"{row.get('market_title') or ''}\n"
-                        f"{row['market_ticker']} NO {price:.2f}")
+            wanted = float(row["count"] or 0)
+            total = 0.0
+            notional = 0.0
+            first_t = None
+            for f in fills:
+                try:
+                    c = float(f.get("count_fp") or f.get("count") or 0)
+                except (TypeError, ValueError):
+                    c = 0.0
+                if c <= 0:
+                    continue
+                px = kalshi.to_dollars(f.get("no_price_dollars") or f.get("no_price")) \
+                    or float(row["limit_price"])
+                total += c
+                notional += c * px
+                ts = clock.parse_iso(f.get("created_time"))
+                if ts and (first_t is None or ts < first_t):
+                    first_t = ts
+            if total <= 1e-9:
+                continue
+            vwap = notional / total
+            done = wanted <= 0 or total + 1e-9 >= wanted
+            was = float(row.get("filled_count") or 0)
+            store.update_order(
+                row["id"],
+                filled_count=total,
+                fill_price=vwap,
+                filled_at=row.get("filled_at") or first_t or clock.now_utc(),
+                status="filled" if done else "resting",
+            )
+            if total > was + 1e-9:
+                store.log_line(
+                    "fill",
+                    f"[{ev['series']}/LIVE] FILL {row['market_ticker']} "
+                    f"NO {vwap:.2f} now {total:g}/{wanted:g}"
+                )
+                self.notify(
+                    f"LIVE FILL ({ev['series']}) "
+                    f"{row.get('market_title') or ''}\n"
+                    f"{row['market_ticker']} NO {vwap:.2f}  "
+                    f"{total:g}/{wanted:g}"
+                    + ("" if not done else "\nComplete.")
+                )
 
     # ------------------------------------------------------------- cancel ---
 
