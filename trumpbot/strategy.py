@@ -59,8 +59,8 @@ def _cutoff_listed_utc():
 # Event polling cadence. Polling every open event every 5s does not scale past
 # a handful of events; near the cancel it has to be tight, far from it it does
 # not.
-POLL_HOT_SECONDS = 5          # within HOT_WINDOW of cancel
-POLL_WARM_SECONDS = 20        # a placing event, cancel still far off
+POLL_HOT_SECONDS = 5          # placing events: match live as closely as Cloud allows
+POLL_WARM_SECONDS = 5         # same as hot; poll interval is not a research input
 POLL_COLD_SECONDS = 120       # LOG events: quotes only
 HOT_WINDOW_MINUTES = 20
 
@@ -512,7 +512,7 @@ class Engine:
             self.check_paper_fills(ev, markets)
 
     def check_paper_fills(self, ev: Dict[str, Any], markets: List[Dict[str, Any]]) -> None:
-        """DRY: keep working the leftover. Price the slice off the book."""
+        """DRY: fill only while the book offers NO at or under the limit."""
         by_ticker = {m.get("ticker"): m for m in markets}
         for row in store.resting_orders(ev["event_ticker"], mode=config.MODE_DRY):
             m = by_ticker.get(row["market_ticker"])
@@ -534,6 +534,7 @@ class Engine:
             if slice_n <= 1e-9:
                 continue
             px = min(limit, max(0.01, ask))
+            src = f"book {ask:.2f}"
             total = already + slice_n
             prev_px = float(row["fill_price"] or limit)
             vwap = ((already * prev_px) + (slice_n * px)) / total
@@ -548,15 +549,14 @@ class Engine:
             store.log_line(
                 "fill",
                 f"[{ev['series']}/DRY] PAPER SLICE {row['market_ticker']} "
-                f"NO {px:.2f} x {slice_n:g} (book {ask:.2f}) "
-                f"now {total:g}/{wanted:g}"
+                f"NO {px:.2f} x {slice_n:g} ({src}) now {total:g}/{wanted:g}"
             )
             self.notify(
                 f"FILL ({ev['series']}) [DRY] "
                 f"{row.get('market_title') or ''}\n"
                 f"{row['market_ticker']}\n"
                 f"NO {px:.2f} x {slice_n:g}  ({total:g}/{wanted:g})\n"
-                f"Book was offering NO at {ask:.2f}"
+                f"{src}"
                 + ("" if not done else "\nComplete.")
             )
 
