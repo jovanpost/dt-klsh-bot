@@ -57,6 +57,17 @@ def log_notify_on() -> bool:
     return store.get_state("notify_log", "0") == "1"
 
 
+def fills_notify_on() -> bool:
+    """Per-fill Telegram. Default muted — missing key means off."""
+    return store.get_state("notify_fills", "0") == "1"
+
+
+def notify_summary() -> str:
+    fills = "on" if fills_notify_on() else "muted"
+    logs = "on" if log_notify_on() else "muted"
+    return f"Telegram: fills {fills}, LOG {logs}"
+
+
 def _resolve_series(name: str) -> Optional[str]:
     want = (name or "").strip().upper()
     if not want:
@@ -95,6 +106,7 @@ def status_text() -> str:
 
     lines = [
         f"Worker: {'PAUSED' if paused else 'running'}",
+        notify_summary(),
         f"Last poll: {clock.fmt_ct(clock.parse_iso(store.get_state('last_poll')))}",
         f"Series: {len(cfgs)}  (" + ", ".join(f"{k} {v}" for k, v in sorted(by_mode.items())) + ")",
         f"Open events: {len(live)}   Resting orders: {len(resting)}",
@@ -431,11 +443,34 @@ def _handle_when(arg: str) -> None:
              f"Use /cancel {ticker} to pull orders now.")
 
 
+def _handle_mute(arg: str, on: bool) -> None:
+    """FILLS is the default target so /mute with no arg quiets fill spam."""
+    target = (arg or "FILLS").strip().upper()
+    if target in ("FILL", "FILLS"):
+        store.set_state("notify_fills", "1" if on else "0")
+        if on:
+            send("Fill Telegram unmuted. You will get FILL / LIVE FILL on each slice.")
+        else:
+            send("Fills muted. NEW EVENT, NEEDS A TIME, TIME UPDATED, "
+                 "CANCELLED, SETTLED, and issues still ping.")
+        return
+    if target == "LOG":
+        store.set_state("notify_log", "1" if on else "0")
+        if on:
+            send("LOG Telegram unmuted. You will get NEW EVENT on LOG series.")
+        else:
+            send("LOG Telegram muted. DRY/LIVE and RESEARCH REVIEW still ping.")
+        return
+    send("Usage: /mute FILLS | /mute LOG\n       /unmute FILLS | /unmute LOG")
+
+
 HELP = """Commands:
 /status  - family rollup, open events, next cancels, fills today
 /ready   - $0.25 smoke + family size-up; /ready SERIES for the detail
 /logstatus - LOG families: when to re-run research for DRY
 /logreviewed FAMILY - mark that research review done
+/mute FILLS - silence per-fill pings (default). Alias: /mute
+/unmute FILLS - turn FILL / LIVE FILL back on
 /mute LOG - silence NEW EVENT / TIME / CLOSED on LOG series (default)
 /unmute LOG - turn those back on
 /mode    - series and family modes; /mode <SERIES|FAMILY> LIVE|DRY|LOG|OFF
@@ -507,17 +542,9 @@ class Listener(threading.Thread):
                 n = analytics.mark_log_reviewed(fam)
                 send(f"{fam}: review marked. Baseline {n} LOG events.")
             elif cmd == "/mute":
-                if arg.strip().upper() == "LOG":
-                    store.set_state("notify_log", "0")
-                    send("LOG Telegram muted. DRY/LIVE and RESEARCH REVIEW still ping.")
-                else:
-                    send("Usage: /mute LOG")
+                _handle_mute(arg, on=False)
             elif cmd == "/unmute":
-                if arg.strip().upper() == "LOG":
-                    store.set_state("notify_log", "1")
-                    send("LOG Telegram unmuted. You will get NEW EVENT on LOG series.")
-                else:
-                    send("Usage: /unmute LOG")
+                _handle_mute(arg, on=True)
             elif cmd == "/mode":
                 _handle_mode(arg)
             elif cmd == "/series":
