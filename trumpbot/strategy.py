@@ -105,6 +105,16 @@ class Engine:
                 return
         self.notify(message)
 
+    def notify_fill(self, message: str) -> None:
+        """Per-market fill pings. Default off; /unmute FILLS turns them on."""
+        try:
+            from . import telegram_bot
+            if not telegram_bot.fills_notify_on():
+                return
+        except Exception:
+            return
+        self.notify(message)
+
     # ------------------------------------------------------------- helpers ---
 
     def _pick_time(self, blobs: List[Dict[str, Any]], fields) -> Tuple[Optional[Any], Optional[str]]:
@@ -399,7 +409,7 @@ class Engine:
                 placed += 1
             elif filled_now:
                 placed += 1
-                self.notify(f"LIVE FILL ({series}) {ticker} NO {price:.2f} (at place)")
+                self.notify_fill(f"LIVE FILL ({series}) {ticker} NO {price:.2f} (at place)")
 
         if placed:
             ev = store.get_event(event_ticker) or {}
@@ -551,7 +561,7 @@ class Engine:
                 f"[{ev['series']}/DRY] PAPER SLICE {row['market_ticker']} "
                 f"NO {px:.2f} x {slice_n:g} ({src}) now {total:g}/{wanted:g}"
             )
-            self.notify(
+            self.notify_fill(
                 f"FILL ({ev['series']}) [DRY] "
                 f"{row.get('market_title') or ''}\n"
                 f"{row['market_ticker']}\n"
@@ -606,7 +616,7 @@ class Engine:
                     f"[{ev['series']}/LIVE] FILL {row['market_ticker']} "
                     f"NO {vwap:.2f} now {total:g}/{wanted:g}"
                 )
-                self.notify(
+                self.notify_fill(
                     f"LIVE FILL ({ev['series']}) "
                     f"{row.get('market_title') or ''}\n"
                     f"{row['market_ticker']} NO {vwap:.2f}  "
