@@ -64,6 +64,10 @@ POLL_WARM_SECONDS = 5         # same as hot; poll interval is not a research inp
 POLL_COLD_SECONDS = 120       # LOG events: quotes only
 HOT_WINDOW_MINUTES = 20
 
+# First Yes >= 98c on any market of an open event = the show is on.
+# Flatten every still-resting sibling. Overrides hold-to-settlement.
+SLAM_YES_BID = 0.98
+
 KILL_CHECK_SECONDS = 600
 
 
@@ -510,6 +514,8 @@ class Engine:
         self.place_missing(cfg, ticker, markets, mode)
         if mode in config.PLACING_MODES:
             self.check_fills(ev, markets, mode)
+            if self.maybe_slam_flatten(ev, markets):
+                return
         self.sample_ticks(ev, markets)
 
     # ------------------------------------------------------------- fills ---
@@ -543,8 +549,10 @@ class Engine:
             slice_n = remaining if available is None else min(remaining, max(0.0, available))
             if slice_n <= 1e-9:
                 continue
-            px = min(limit, max(0.01, ask))
-            src = f"book {ask:.2f}"
+            # Live GTC is taken at the resting limit when YES sweeps through
+            # 1-limit. Do not mark fill_price to the post-slam 1c ask.
+            px = limit
+            src = f"book {ask:.2f} -> limit {limit:.2f}"
             total = already + slice_n
             prev_px = float(row["fill_price"] or limit)
             vwap = ((already * prev_px) + (slice_n * px)) / total
@@ -623,6 +631,42 @@ class Engine:
                     f"{total:g}/{wanted:g}"
                     + ("" if not done else "\nComplete.")
                 )
+
+    def _yes_bid(self, market: Dict[str, Any]) -> Optional[float]:
+        yb = kalshi.quote(market, "yes", "bid")
+        if yb is not None:
+            return yb
+        ask = kalshi.no_ask(market)
+        if ask is not None:
+            return round(1.0 - ask, 4)
+        return None
+
+    def maybe_slam_flatten(self, ev: Dict[str, Any],
+                           markets: List[Dict[str, Any]]) -> bool:
+        """If any word on this event is Yes >= 98c, pull every resting sibling.
+
+        Does not care whether we filled that word 60s or 60d ago. Clock
+        cancel still exists; this is the late-clock / first-utterance patch.
+        """
+        mode = config.normalize_mode(ev.get("mode"))
+        if mode not in config.PLACING_MODES:
+            return False
+        hit = None
+        for m in markets:
+            yb = self._yes_bid(m)
+            if yb is not None and yb + 1e-12 >= SLAM_YES_BID:
+                hit = m
+                break
+        if hit is None:
+            return False
+        word = hit.get("ticker") or "?"
+        title = hit.get("yes_sub_title") or hit.get("subtitle") or ""
+        self.cancel_event(
+            ev,
+            reason=f"emergency slam Yes {SLAM_YES_BID:.2f}+ on {word}"
+                   + (f" ({title})" if title else ""),
+        )
+        return True
 
     # ------------------------------------------------------------- cancel ---
 
@@ -849,3 +893,4 @@ class Engine:
             return
         if markets:
             self.check_fills(ev, markets, mode)
+            self.maybe_slam_flatten(ev, markets)
