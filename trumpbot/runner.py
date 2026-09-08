@@ -26,6 +26,7 @@ class Runner(threading.Thread):
         self.listener = telegram_bot.Listener(engine=self.engine)
         self._stop = threading.Event()
         self._last_settle = 0.0
+        self._last_prune = 0.0
         self.error: Optional[str] = None
 
     def stop(self) -> None:
@@ -54,6 +55,17 @@ class Runner(threading.Thread):
 
         self.listener.start()
 
+        # tm_ticks is write-only operational quotes. 14d cap was already
+        # written; it was never scheduled. Does not touch WNT depth_*.
+        try:
+            n = store.prune_ticks(14)
+            self._last_prune = time.time()
+            if n:
+                store.log_line("info", f"pruned {n} tm_ticks rows older than 14d")
+                telegram_bot.send(f"PRUNED tm_ticks: {n} rows older than 14d.")
+        except Exception as exc:
+            log.warning("Tick prune on startup failed: %s", exc)
+
         while not self._stop.is_set():
             started = time.time()
             try:
@@ -67,6 +79,16 @@ class Runner(threading.Thread):
                         settle.run(self.client, telegram_bot.send)
                     except Exception as exc:
                         log.warning("Settlement pass failed: %s", exc)
+
+                if started - self._last_prune >= 86400:
+                    self._last_prune = started
+                    try:
+                        n = store.prune_ticks(14)
+                        if n:
+                            store.log_line("info", f"pruned {n} tm_ticks rows older than 14d")
+                            telegram_bot.send(f"PRUNED tm_ticks: {n} rows older than 14d.")
+                    except Exception as exc:
+                        log.warning("Tick prune failed: %s", exc)
             except Exception as exc:
                 self.error = str(exc)
                 log.exception("Tick failed")
