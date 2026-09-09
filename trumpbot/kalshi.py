@@ -278,14 +278,21 @@ class KalshiClient:
         """Buy NO at a limit via Create Order V2.
 
         V2 quotes the YES book only: side=ask is sell-YES, which is buy-NO
-        at (1 - price). The June 2026 cut removed POST /portfolio/orders
-        (action/side/yes/no + integer cents).
+        at (1 - price). The phone shows YES notional (count × yes_price),
+        not NO collateral. Do not cancel to "fix" that.
+
+        client_order_id must be a UUID. A slug with a decimal size 400s.
+        uuid5 is deterministic so a retry does not double-rest.
         """
         if config.LIVE_COUNT_MODE == "floor":
             send_count = f"{max(1, int(count)):.2f}"
         else:
             send_count = f"{float(count):.6f}".rstrip("0").rstrip(".") or "1"
         yes_price = max(0.01, min(0.99, round(1.0 - float(no_price), 4)))
+        client_order_id = str(uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"dt-klsh|{ticker}|{send_count}|{yes_price:.4f}|v2",
+        ))
         body: Dict[str, Any] = {
             "ticker": ticker,
             "side": "ask",  # sell YES == buy NO
@@ -294,7 +301,7 @@ class KalshiClient:
             "time_in_force": "good_till_canceled",
             "self_trade_prevention_type": "taker_at_cross",
             "post_only": False,
-            "client_order_id": str(uuid.uuid4()),
+            "client_order_id": client_order_id,
         }
         if expiration_ts:
             body["expiration_time"] = int(expiration_ts)
