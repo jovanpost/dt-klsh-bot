@@ -159,11 +159,15 @@ class Engine:
             return opened
         return None
 
-    def _first_list(self, markets: List[Dict[str, Any]]) -> bool:
+    def _open_at(self, markets: List[Dict[str, Any]]):
         opened, _ = self._pick_time(list(markets), OPEN_FIELDS)
+        return clock.to_utc(opened) if opened else None
+
+    def _first_list(self, markets: List[Dict[str, Any]]) -> bool:
+        opened = self._open_at(markets)
         if not opened:
             return False
-        age = (clock.now_utc() - clock.to_utc(opened)).total_seconds()
+        age = (clock.now_utc() - opened).total_seconds()
         return 0 <= age <= config.FIRST_LIST_GRACE_SECONDS
 
     # ----------------------------------------------------------- discovery ---
@@ -171,22 +175,32 @@ class Engine:
     def due_series(self) -> List[str]:
         """Series whose discovery sweep is due, stalest first, capped.
 
-        One events call per series per tick is 4 requests/second at ~180
-        series before any market polling. LOG series sweep every 15 minutes;
-        DRY and LIVE every 45 seconds; OFF never.
+        POLITICIAN / NEWS_SHOW / ENTERTAINMENT in DRY or LIVE are hot:
+        every worker tick, first 6 slots. Everything else fills the
+        remaining 2 so LOG earnings do not starve the mention tape.
         """
         now = _time.time()
-        due: List[Tuple[float, str]] = []
+        hot: List[Tuple[float, str]] = []
+        cold: List[Tuple[float, str]] = []
         for s, cfg in config.series_config().items():
-            interval = config.DISCOVERY_INTERVAL_BY_MODE.get(cfg["mode"])
+            mode = cfg.get("mode")
+            interval = config.DISCOVERY_INTERVAL_BY_MODE.get(mode)
             if interval is None:
                 continue
+            if (cfg.get("family") in config.HOT_FAMILIES
+                    and mode in config.PLACING_MODES):
+                interval = config.HOT_DISCOVERY_SECONDS
             last = self._series_swept.get(s, 0.0)
             waited = now - last
-            if waited >= interval:
-                due.append((waited / interval, s))
-        due.sort(reverse=True)
-        return [s for _, s in due[:config.DISCOVERY_MAX_SERIES_PER_TICK]]
+            if waited < interval:
+                continue
+            bucket = hot if interval == config.HOT_DISCOVERY_SECONDS else cold
+            bucket.append((waited / interval, s))
+        hot.sort(reverse=True)
+        cold.sort(reverse=True)
+        pick = [s for _, s in hot[:config.DISCOVERY_MAX_HOT_PER_TICK]]
+        pick += [s for _, s in cold[:config.DISCOVERY_MAX_COLD_PER_TICK]]
+        return pick[:config.DISCOVERY_MAX_SERIES_PER_TICK]
 
     def discover(self) -> int:
         found = 0
@@ -285,6 +299,7 @@ class Engine:
                 "title": ev.get("title"),
                 "discovered_at": clock.now_utc(),
                 "discovered_at_open": False,
+                "open_at": self._open_at(markets),
                 "cancel_source": "pre_cutoff",
                 "traded": False,
                 "markets_seen": len(markets),
@@ -306,6 +321,7 @@ class Engine:
             "mode": mode, "title": ev.get("title"),
             "subtitle": ev.get("sub_title") or ev.get("subtitle"),
             "discovered_at": now, "discovered_at_open": at_open,
+            "open_at": self._open_at(markets),
             "occurrence_at": occ, "close_at": close,
             "cancel_at": cancel_at, "cancel_source": source,
             "traded": False, "markets_seen": len(markets), "orders_placed": 0,
