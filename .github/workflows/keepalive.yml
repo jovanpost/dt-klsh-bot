@@ -11,17 +11,35 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-      - name: Install Playwright
-        run: |
-          npm install playwright
-          npx playwright install --with-deps chromium
-      - name: Open the app
+      - name: Curl ping
+        id: curl
         env:
           APP_URL: ${{ vars.APP_URL }}
         run: |
+          set -euo pipefail
+          URL="$(echo "${APP_URL:-https://dt-klsh-bot.streamlit.app}" | sed 's:/*$::')"
+          PING="${URL}/?ping=true"
+          echo "pinging $PING"
+          CODE=$(curl -sS -o /tmp/ping.body -w "%{http_code}" --max-time 30 "$PING" || true)
+          echo "http $CODE"
+          head -c 200 /tmp/ping.body || true
+          echo
+          if [ "$CODE" = "200" ] && grep -qx "ok" /tmp/ping.body; then
+            echo "awake=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "awake=0" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/setup-node@v4
+        if: steps.curl.outputs.awake != '1'
+        with:
+          node-version: "20"
+      - name: Wake with bundled Chromium
+        if: steps.curl.outputs.awake != '1'
+        env:
+          APP_URL: ${{ vars.APP_URL }}
+        run: |
+          npm install playwright
+          npx playwright install chromium
           node -e '
           const { chromium } = require("playwright");
           (async () => {
@@ -29,16 +47,17 @@ jobs:
               .replace(/\/$/, "") + "/?ping=true";
             const browser = await chromium.launch();
             const page = await browser.newPage();
-            console.log("pinging " + url);
+            console.log("waking " + url);
             await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
             await page.waitForTimeout(6000);
             const wake = page.getByRole("button", { name: /get this app back up/i });
             if (await wake.count()) {
-              console.log("app was asleep, waking it");
+              console.log("app was asleep, clicking wake");
               await wake.first().click();
               await page.waitForTimeout(20000);
             }
-            console.log("done");
+            const body = (await page.textContent("body") || "").trim();
+            console.log("body", body.slice(0, 80));
             await browser.close();
           })();
           '
