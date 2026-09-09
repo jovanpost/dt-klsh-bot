@@ -124,39 +124,60 @@ st.divider()
 
 st.subheader("How close to LIVE")
 st.caption("Every gate must pass before going live is even a conversation. "
-           "Counts use first-list events only.")
+           "Counts use first-list events only. Family unlock is the size-up "
+           "bar; series smoke is $0.25 after that.")
 
+fam_state: Dict[str, Any] = {}
+for fam in sorted({c["family"] for c in series_cfg.values()}):
+    fam_state[fam] = analytics.family_unlocked(fam, rows_all, events_all)
+
+fam_table = []
+for fam, fs in fam_state.items():
+    fam_table.append({
+        "Family": fam,
+        "Unlocked": "yes" if fs["unlocked"] else "",
+        "Gates": f"{sum(1 for g in fs['gates'] if g['ok'])}/{len(fs['gates'])}",
+        "FL events": fs["events_first_list"],
+        "Settled": fs["stats"]["settled"],
+        "Days": fs["day"]["settled_days"],
+        "Cushion": "--" if fs["stats"]["cushion"] is None
+        else f"{100 * fs['stats']['cushion']:+.1f}",
+        "P(No|f)": pct(fs["stats"]["p_no"], 1),
+    })
+st.dataframe(pd.DataFrame(fam_table), use_container_width=True, hide_index=True)
+
+dry_series = sorted(s for s, c in series_cfg.items()
+                    if c.get("mode") == config.MODE_DRY)
 ready_rows = []
 detail: Dict[str, Any] = {}
-for s, cfg in sorted(series_cfg.items()):
-    if cfg["mode"] == config.MODE_OFF:
-        continue
+for s in dry_series:
+    cfg = series_cfg[s]
     srows = analytics.filter_orders(rows_all, series=s, mode=cfg["mode"],
                                     first_list_only=True,
                                     events_by_ticker=ev_index)
-    rd = analytics.readiness(s, srows, events_all)
+    rd = analytics.readiness(s, srows, events_all,
+                             fam_state=fam_state.get(cfg.get("family") or "OTHER"),
+                             all_rows=rows_all, all_events=events_all)
     detail[s] = rd
     ready_rows.append({
         "Series": s,
         "Family": rd["family"],
-        "Mode": rd["mode"],
-        "Price": num(rd["price"], 2),
-        "Stake": money(rd["dollars"]),
         "Gates": f"{rd['passed']}/{rd['total']}",
-        "Events": rd["events_first_list"],
-        "Fills settled": rd["stats"]["settled"],
-        "P(No|filled)": pct(rd["stats"]["p_no"], 1),
+        "FL events": rd["events_first_list"],
+        "Settled": rd["stats"]["settled"],
+        "P(No|f)": pct(rd["stats"]["p_no"], 1),
         "Cushion": "--" if rd["stats"]["cushion"] is None
         else f"{100 * rd['stats']['cushion']:+.1f}",
-        "$/day low": num(rd["day"]["boot_low"], 2),
         "Ready": "yes" if rd["ready"] else "",
     })
 
 if ready_rows:
+    st.caption("DRY series only. LOG is review-only and is not in this table.")
     st.dataframe(pd.DataFrame(ready_rows), use_container_width=True, hide_index=True)
-
-    pick = st.selectbox("Gate detail for", sorted(detail.keys()))
+    pick = st.selectbox("Gate detail", dry_series)
     rd = detail[pick]
+    st.caption(f"{rd['path']} · family unlocked="
+               f"{'yes' if rd['family_unlocked'] else 'no'}")
     for g in rd["gates"]:
         mark = "PASS" if g["ok"] else "not yet"
         left, right = st.columns([3, 1])
@@ -168,8 +189,13 @@ if ready_rows:
             if g["note"]:
                 st.caption(g["note"])
         right.write(f"{g['have']} / {g['need']}")
+    st.caption("Family size-up gates for this series:")
+    for g in rd.get("family_gates") or []:
+        mark = "PASS" if g["ok"] else "not yet"
+        st.write(f"- {g['name']}: {g['have']} / {g['need']} ({mark})"
+                 + (f" — {g['note']}" if g.get("note") else ""))
 else:
-    st.caption("No series active.")
+    st.caption("No DRY series.")
 
 st.divider()
 
