@@ -57,6 +57,7 @@ events = Table(
     Column("subtitle", Text),
     Column("discovered_at", DateTime(timezone=True)),
     Column("discovered_at_open", Boolean, default=False),
+    Column("open_at", DateTime(timezone=True)),  # Kalshi market open_time at first list
     Column("occurrence_at", DateTime(timezone=True)),
     Column("close_at", DateTime(timezone=True)),
     Column("cancel_at", DateTime(timezone=True)),
