@@ -412,6 +412,11 @@ class Engine:
                     log.error("Order rejected on %s: %s", ticker, exc)
                     store.log_line("error", f"Order rejected on {ticker}: {exc}")
                     status = "rejected"
+                    self.announce(
+                        mode,
+                        f"LIVE REJECT ({series})\n{ticker}\n{exc}\n"
+                        f"Will retry next poll. Do not place by hand.",
+                    )
 
             store.record_order({
                 "series": series, "family": family, "mode": mode,
