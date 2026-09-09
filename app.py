@@ -6,8 +6,11 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
+import json
+
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 from trumpbot import analytics, clock, config, runner, store
 
@@ -54,6 +57,85 @@ def money(x):
 
 def num(x, digits=3):
     return "--" if x is None else f"{float(x):.{digits}f}"
+
+
+def _gate_line(g: Dict[str, Any]) -> str:
+    mark = "PASS" if g.get("ok") else "not yet"
+    return f"- {g.get('name')}: {g.get('have')} / {g.get('need')} ({mark})" + (
+        f" — {g['note']}" if g.get("note") else ""
+    )
+
+
+def _cush(v) -> str:
+    return "--" if v is None else f"{100 * float(v):+.1f}"
+
+
+def live_gates_markdown(fam_state: Dict[str, Any],
+                        ready_rows: List[Dict[str, Any]],
+                        detail: Dict[str, Any],
+                        overall: Dict[str, Any],
+                        overall_day: Dict[str, Any]) -> str:
+    lines = [
+        f"# Mentions bot — how close to LIVE",
+        f"As of {clock.fmt_ct(clock.now_utc())} CT.",
+        "",
+        "Counts are first-list only. Family unlock is the size-up bar; "
+        "series smoke is $0.25 after the family unlocks. Do not treat this "
+        "as a go-live instruction.",
+        "",
+        "## Headline (page filters)",
+        f"- Orders {overall.get('orders')} · fill {pct(overall.get('fill_rate'))} · "
+        f"P(No|f) {pct(overall.get('p_no'), 1)} · "
+        f"cushion {_cush(overall.get('cushion'))} pts · "
+        f"P/L {money(overall.get('pnl'))} · "
+        f"$/day {money(overall_day.get('mean_per_day'))} · "
+        f"boot low {money(overall_day.get('boot_low'))} · "
+        f"settled days {overall_day.get('settled_days')}",
+        "",
+        "## Family unlock",
+    ]
+    for fam, fs in fam_state.items():
+        npass = sum(1 for g in fs["gates"] if g["ok"])
+        lines.append(
+            f"### {fam} — {'UNLOCKED' if fs['unlocked'] else 'locked'} "
+            f"({npass}/{len(fs['gates'])})"
+        )
+        lines.append(
+            f"FL events {fs['events_first_list']} · settled {fs['stats']['settled']} · "
+            f"days {fs['day']['settled_days']} · "
+            f"P(No|f) {pct(fs['stats']['p_no'], 1)} · "
+            f"cushion {_cush(fs['stats']['cushion'])}"
+        )
+        for g in fs["gates"]:
+            lines.append(_gate_line(g))
+        lines.append("")
+    lines += ["## DRY series smoke", ""]
+    if ready_rows:
+        lines.append("| Series | Family | Gates | FL events | Settled | P(No|f) | Cushion | Ready |")
+        lines.append("|---|---|---|---|---|---|---|---|")
+        for r in ready_rows:
+            lines.append(
+                f"| {r['Series']} | {r['Family']} | {r['Gates']} | {r['FL events']} | "
+                f"{r['Settled']} | {r['P(No|f)']} | {r['Cushion']} | {r['Ready'] or ''} |"
+            )
+        lines.append("")
+        for s in sorted(detail):
+            rd = detail[s]
+            lines.append(
+                f"### {s} ({rd.get('family')}) — "
+                f"{rd['passed']}/{rd['total']} · "
+                f"{'READY' if rd.get('ready') else 'not ready'} · "
+                f"{rd.get('path')}"
+            )
+            for g in rd.get("gates") or []:
+                lines.append(_gate_line(g))
+            lines.append("Family gates:")
+            for g in rd.get("family_gates") or []:
+                lines.append(_gate_line(g))
+            lines.append("")
+    else:
+        lines.append("No DRY series.")
+    return "\n".join(lines)
 
 
 st.title("Mentions bot")
@@ -122,7 +204,10 @@ else:
 
 st.divider()
 
-st.subheader("How close to LIVE")
+head_l, head_r = st.columns([4, 1])
+with head_l:
+    st.subheader("How close to LIVE")
+copy_slot = head_r.empty()
 st.caption("Every gate must pass before going live is even a conversation. "
            "Counts use first-list events only. Family unlock is the size-up "
            "bar; series smoke is $0.25 after that.")
@@ -170,6 +255,24 @@ for s in dry_series:
         else f"{100 * rd['stats']['cushion']:+.1f}",
         "Ready": "yes" if rd["ready"] else "",
     })
+
+_tape = live_gates_markdown(fam_state, ready_rows, detail, overall, overall_day)
+with copy_slot.container():
+    st.download_button(
+        "Copy .md",
+        data=_tape.encode("utf-8"),
+        file_name="live-gates.md",
+        mime="text/markdown",
+        help="Hidden markdown tape for the analytics chat.",
+    )
+    components.html(
+        "<button style='width:100%;padding:6px 8px;font:13px sans-serif;"
+        "border:1px solid #888;border-radius:6px;background:#fff;cursor:pointer'"
+        "onclick='navigator.clipboard.writeText(" + json.dumps(_tape) +
+        ").then(()=>this.textContent=\"Copied\").catch(()=>this.textContent=\"Failed\")'>"
+        "Copy markdown</button>",
+        height=40,
+    )
 
 if ready_rows:
     st.caption("DRY series only. LOG is review-only and is not in this table.")
