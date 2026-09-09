@@ -338,11 +338,17 @@ def record_order(row: Dict[str, Any]) -> None:
 
 
 def existing_market_tickers(event_ticker: str, mode: str) -> set:
+    """Markets that already have a live attempt we must not twin.
+
+    Rejected rows do not count. A V2 400 that wrote status=rejected used
+    to skip the ticker forever, same class of bug as WNT day_handled.
+    """
     with get_engine().connect() as conn:
         rows = conn.execute(
             select(orders.c.market_ticker).where(
                 and_(orders.c.event_ticker == event_ticker,
-                     orders.c.mode == mode))).all()
+                     orders.c.mode == mode,
+                     orders.c.status != "rejected"))).all()
     return {r[0] for r in rows}
 
 
