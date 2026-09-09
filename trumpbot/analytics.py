@@ -206,7 +206,10 @@ def family_unlocked(family: str, rows: List[Dict[str, Any]],
 
 
 def readiness(series: str, rows: List[Dict[str, Any]],
-              events: List[Dict[str, Any]]) -> Dict[str, Any]:
+              events: List[Dict[str, Any]],
+              fam_state: Dict[str, Any] = None,
+              all_rows: List[Dict[str, Any]] = None,
+              all_events: List[Dict[str, Any]] = None) -> Dict[str, Any]:
     cfg = config.series_cfg(series) or {}
     family = cfg.get("family") or "OTHER"
     mine = [e for e in events if e.get("series") == series]
@@ -219,10 +222,12 @@ def readiness(series: str, rows: List[Dict[str, Any]],
     cushion = st["cushion"]
     n_ev_fills = events_with_settled_fills(rows)
     is_six = series in config.SMOKE_SIX
-    from . import store
-    all_rows = store.orders_for_dashboard(limit=20000)
-    all_events = store.all_events(limit=2000)
-    fam_state = family_unlocked(family, all_rows, all_events)
+    if fam_state is None:
+        if all_rows is None or all_events is None:
+            from . import store
+            all_rows = store.orders_for_dashboard(limit=20000)
+            all_events = store.all_events(limit=2000)
+        fam_state = family_unlocked(family, all_rows, all_events)
 
     gates: List[Dict[str, Any]] = []
     gates.append(_gate("Mode is DRY", cfg.get("mode") == config.MODE_DRY,
